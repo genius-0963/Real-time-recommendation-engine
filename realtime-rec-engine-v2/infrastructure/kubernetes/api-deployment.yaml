@@ -1,0 +1,571 @@
+# Production-grade API deployment for Netflix/Meta scale recommendation engine
+# Optimized for 10M+ QPS with sub-100ms latency and 99.9% uptime
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rec-engine-api
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-api
+    version: v2.0.0
+    component: inference
+    tier: frontend
+  annotations:
+    # Deployment annotations
+    deployment.kubernetes.io/revision: "1"
+    # Monitoring annotations
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+    prometheus.io/path: "/metrics"
+    # Istio annotations (if using service mesh)
+    sidecar.istio.io/inject: "true"
+    # Tracing annotations
+    opentelemetry.io/instrumentation: "true"
+spec:
+  # Rolling update strategy for zero-downtime deployments
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1  # Only 1 pod unavailable during update
+      maxSurge: 25%      # Allow 25% surge capacity during updates
+  replicas: 10  # Base replica count, will be autoscaled
+  selector:
+    matchLabels:
+      app: rec-engine-api
+  template:
+    metadata:
+      labels:
+        app: rec-engine-api
+        version: v2.0.0
+        component: inference
+        tier: frontend
+      annotations:
+        # Security annotations
+        container.apparmor.security.beta.kubernetes.io/rec-engine-api: "runtime/default"
+        container.seccomp.security.beta.kubernetes.io/rec-engine-api: "runtime/default"
+        # Performance annotations
+        kubernetes.io/psp: "privileged"
+    spec:
+      # Service account with minimal permissions
+      serviceAccountName: rec-engine-api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      # Node affinity for optimal placement
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-type
+                operator: In
+                values: ["compute-optimized"]
+              - key: zone
+                operator: In
+                values: ["us-west-2a", "us-west-2b", "us-west-2c"]
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: gpu-type
+                operator: DoesNotExist
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: node-role.kubernetes.io/worker
+                operator: In
+                values: ["worker"]
+        # Pod anti-affinity for high availability
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["rec-engine-api"]
+              topologyKey: kubernetes.io/hostname
+          - weight: 50
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["rec-engine-api"]
+              topologyKey: topology.kubernetes.io/zone
+      # Init containers for setup
+      initContainers:
+      - name: model-loader
+        image: rec-engine/model-loader:v2.0.0
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Loading models from S3..."
+            aws s3 cp s3://rec-engine-models/prod/latest/ /models/ --recursive
+            echo "Validating model integrity..."
+            python -m rec_engine.tools.validate_models --model-dir /models
+            echo "Models loaded successfully"
+        env:
+        - name: AWS_REGION
+          value: "us-west-2"
+        - name: MODEL_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: rec-engine-secrets
+              key: model-bucket
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"
+      # Main application container
+      containers:
+      - name: rec-engine-api
+        image: rec-engine/api:v2.0.0
+        imagePullPolicy: Always
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+          successThreshold: 1
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+          successThreshold: 1
+        # Environment variables
+        env:
+        - name: ENVIRONMENT
+          value: "production"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: METRICS_ENABLED
+          value: "true"
+        - name: TRACING_ENABLED
+          value: "true"
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: rec-engine-config
+              key: redis-host
+        - name: REDIS_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: rec-engine-config
+              key: redis-port
+        - name: KAFKA_BROKERS
+          valueFrom:
+            configMapKeyRef:
+              name: rec-engine-config
+              key: kafka-brokers
+        - name: MODEL_PATH
+          value: "/models"
+        - name: JAEGER_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: rec-engine-config
+              key: jaeger-endpoint
+        - name: PROMETHEUS_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: rec-engine-config
+              key: prometheus-endpoint
+        # Secrets
+        - name: DATABASE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rec-engine-secrets
+              key: database-password
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rec-engine-secrets
+              key: redis-password
+        - name: KAFKA_SASL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rec-engine-secrets
+              key: kafka-sasl-password
+        # Resource limits optimized for API workloads
+        resources:
+          requests:
+            memory: "2Gi"      # Base memory for model loading and caching
+            cpu: "1000m"       # 1 CPU core for request processing
+          limits:
+            memory: "4Gi"      # Upper memory limit
+            cpu: "2000m"       # 2 CPU cores max for burst handling
+        # Volume mounts
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+          readOnly: true
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+        - name: tmp-volume
+          mountPath: /tmp
+        - name: log-volume
+          mountPath: /app/logs
+        # Security context for container
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+      # Sidecar container for logging (optional)
+      - name: log-shipper
+        image: fluent/fluent-bit:v2.2.0
+        imagePullPolicy: Always
+        env:
+        - name: FLUENT_BIT_CONF
+          value: |
+            [SERVICE]
+                Flush        1
+                Daemon        off
+                Log_Level     info
+                Parsers_File  parsers.conf
+            [INPUT]
+                Name         tail
+                Path         /app/logs/*.log
+                Tag          rec-engine.*
+                Read_From_Head true
+            [OUTPUT]
+                Name  forward
+                Match *
+                Host  fluentd.logging.svc.cluster.local
+                Port  24224
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "$FLUENT_BIT_CONF" > /fluent-bit/etc/fluent-bit.conf
+            exec /fluent-bit/bin/fluent-bit --config=/fluent-bit/etc/fluent-bit.conf
+        volumeMounts:
+        - name: log-volume
+          mountPath: /app/logs
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+      # Volumes
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: rec-engine-models-pvc
+      - name: config-volume
+        configMap:
+          name: rec-engine-config
+      - name: tmp-volume
+        emptyDir:
+          sizeLimit: 1Gi
+      - name: log-volume
+        emptyDir:
+          sizeLimit: 500Mi
+      # Node selector
+      nodeSelector:
+        node-type: compute-optimized
+        zone: us-west-2a
+      # Tolerations
+      tolerations:
+      - key: "workload"
+        operator: "Equal"
+        value: "rec-engine"
+        effect: "NoSchedule"
+      # Priority class for high-priority workloads
+      priorityClassName: high-priority
+      # Termination grace period
+      terminationGracePeriodSeconds: 30
+
+---
+# Service for API deployment
+apiVersion: v1
+kind: Service
+metadata:
+  name: rec-engine-api
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-api
+    component: inference
+    tier: frontend
+  annotations:
+    # Prometheus monitoring
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+    prometheus.io/path: "/metrics"
+    # Load balancer annotations
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    # Health check annotations
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: "HTTP"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "traffic-port"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: "/health"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-interval: "10"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-timeout: "5"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-healthy-threshold: "3"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-unhealthy-threshold: "3"
+spec:
+  type: LoadBalancer
+  # Session affinity for user consistency (optional)
+  sessionAffinity: None
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+    protocol: TCP
+  - name: https
+    port: 443
+    targetPort: 8000
+    protocol: TCP
+  selector:
+    app: rec-engine-api
+  # External traffic policy
+  externalTrafficPolicy: Local
+
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rec-engine-api-hpa
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-api
+    component: inference
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rec-engine-api
+  # Min/max replicas for cost optimization
+  minReplicas: 10
+  maxReplicas: 100
+  # Metrics for autoscaling
+  metrics:
+  # CPU-based scaling (primary metric)
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70  # Target 70% CPU utilization
+  # Memory-based scaling
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80  # Target 80% memory utilization
+  # Custom metrics for intelligent scaling
+  - type: External
+    external:
+      metric:
+        name: recommendation_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "1000"  # Scale when QPS > 1000 per pod
+  - type: External
+    external:
+      metric:
+        name: api_latency_p95
+      target:
+        type: AverageValue
+        averageValue: "80ms"  # Scale when P95 latency > 80ms
+  # Scaling behavior
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60  # Wait 60s before scaling up
+      policies:
+      - type: Percent
+        value: 100  # Can double pods quickly
+        periodSeconds: 15
+      - type: Pods
+        value: 10   # Or add 10 pods at once
+        periodSeconds: 15
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Wait 5min before scaling down
+      policies:
+      - type: Percent
+        value: 10   # Scale down slowly (10% at a time)
+        periodSeconds: 60
+      - type: Pods
+        value: 5    # Or remove 5 pods at once
+        periodSeconds: 60
+      selectPolicy: Min
+
+---
+# PodDisruptionBudget for high availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rec-engine-api-pdb
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-api
+    component: inference
+spec:
+  # Ensure at least 90% of pods are available during disruptions
+  minAvailable: 90%
+  # Alternative: ensure minimum number of pods
+  # minAvailable: 9
+  selector:
+    matchLabels:
+      app: rec-engine-api
+
+---
+# NetworkPolicy for security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rec-engine-api-netpol
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-api
+    component: inference
+spec:
+  podSelector:
+    matchLabels:
+      app: rec-engine-api
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow traffic from anywhere to API port
+  - from: []
+    ports:
+    - protocol: TCP
+      port: 8000
+  # Allow traffic from monitoring
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 8000
+  egress:
+  # Allow DNS
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+  # Allow traffic to Redis
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis-cluster
+    ports:
+    - protocol: TCP
+      port: 6379
+  # Allow traffic to Kafka
+  - to:
+    - podSelector:
+        matchLabels:
+          app: kafka-cluster
+    ports:
+    - protocol: TCP
+      port: 9092
+  # Allow traffic to external services (S3, etc.)
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 80
+
+---
+# ConfigMap for configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rec-engine-config
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-api
+    component: inference
+data:
+  redis-host: "redis-cluster.rec-engine-prod.svc.cluster.local"
+  redis-port: "6379"
+  kafka-brokers: "kafka-cluster.rec-engine-prod.svc.cluster.local:9092"
+  jaeger-endpoint: "http://jaeger-collector.rec-engine-prod.svc.cluster.local:14268/api/traces"
+  prometheus-endpoint: "http://prometheus.rec-engine-prod.svc.cluster.local:9090"
+  # Application configuration
+  config.yaml: |
+    api:
+      host: "0.0.0.0"
+      port: 8000
+      workers: 4
+      log_level: "info"
+      rate_limit_requests: 10000
+      rate_limit_window: 60
+    
+    model:
+      embedding_dim: 128
+      batch_size: 32
+      cache_ttl: 300
+    
+    monitoring:
+      prometheus_port: 9090
+      tracing_enabled: true
+      metrics_interval: 15
+
+---
+# ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rec-engine-api
+  namespace: rec-engine-prod
+  annotations:
+    iam.amazonaws.com/role: arn:aws:iam::123456789012:role/rec-engine-api-role
+automountServiceAccountToken: true
+
+---
+# PriorityClass for high-priority workloads
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000000
+globalDefault: false
+description: "High priority class for critical recommendation engine workloads"

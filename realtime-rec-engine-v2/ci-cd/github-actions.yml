@@ -1,0 +1,691 @@
+# Production-grade CI/CD pipeline for Netflix/Meta scale recommendation engine
+# Complete pipeline from code to production with automated testing, security scanning, and deployment
+
+name: Recommendation Engine CI/CD Pipeline
+
+# Environment variables
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: rec-engine
+  DOCKER_BUILDKIT: "1"
+  PYTHON_VERSION: "3.10"
+
+# Triggers
+on:
+  push:
+    branches: [main, develop]
+    tags: ['v*']
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+
+# Global permissions
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  actions: read
+  checks: write
+  pull-requests: write
+
+# Jobs
+jobs:
+  # Code quality and security scanning
+  code-quality:
+    name: Code Quality & Security
+    runs-on: ubuntu-latest
+    outputs:
+      security-scan-passed: ${{ steps.security.outputs.passed }}
+      quality-gate-passed: ${{ steps.quality.outputs.passed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better analysis
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      
+      # Code formatting check
+      - name: Check code formatting
+        run: |
+          black --check --diff .
+          isort --check-only --diff .
+      
+      # Linting
+      - name: Run linting
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+          pylint --fail-under=8.0 $(find . -name "*.py" -not -path "./tests/*")
+      
+      # Type checking
+      - name: Run type checking
+        run: |
+          mypy --ignore-missing-imports --strict-optional --warn-return-any --warn-redundant-casts --warn-unused-ignores .
+      
+      # Security scanning
+      - name: Run security scan
+        id: security
+        run: |
+          bandit -r . -f json -o bandit-report.json || true
+          safety check --json -o safety-report.json || true
+          semgrep --config=auto --json --output=semgrep-report.json . || true
+          
+          # Check if any high-severity issues found
+          if [ -f bandit-report.json ]; then
+            HIGH_ISSUES=$(jq '.results | map(select(.issue_severity == "HIGH")) | length' bandit-report.json)
+            if [ "$HIGH_ISSUES" -gt 0 ]; then
+              echo "Found $HIGH_ISSUES high-severity security issues"
+              exit 1
+            fi
+          fi
+          
+          echo "passed=true" >> $GITHUB_OUTPUT
+      
+      # Code quality metrics
+      - name: Run code quality analysis
+        id: quality
+        run: |
+          # Calculate code metrics
+          TOTAL_FILES=$(find . -name "*.py" -not -path "./tests/*" | wc -l)
+          TOTAL_LINES=$(find . -name "*.py" -not -path "./tests/*" -exec wc -l {} + | tail -1 | awk '{print $1}')
+          COMPLEXITY=$(radon cc . --json | jq -r '.average_cc')
+          COVERAGE=$(python -m pytest --cov=. --cov-report=json tests/ 2>/dev/null || echo "0")
+          
+          echo "total-files=$TOTAL_FILES" >> $GITHUB_OUTPUT
+          echo "total-lines=$TOTAL_LINES" >> $GITHUB_OUTPUT
+          echo "complexity=$COMPLEXITY" >> $GITHUB_OUTPUT
+          echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+          
+          # Quality gate checks
+          if [ "$(echo "$COMPLEXITY > 10" | bc -l)" -eq 1 ]; then
+            echo "Complexity too high: $COMPLEXITY"
+            exit 1
+          fi
+          
+          echo "passed=true" >> $GITHUB_OUTPUT
+      
+      # SonarCloud analysis
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      
+      # Upload security reports
+      - name: Upload security reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            safety-report.json
+            semgrep-report.json
+          retention-days: 30
+
+  # Unit tests
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: code-quality
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-test.txt
+      
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/unit/ \
+            --cov=rec_engine \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=term-missing \
+            --junit-xml=pytest-results.xml \
+            -v
+      
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: pytest-results-${{ matrix.python-version }}
+          path: |
+            pytest-results.xml
+            htmlcov/
+          retention-days: 30
+
+  # Integration tests
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [code-quality, unit-tests]
+    services:
+      # Redis for testing
+      redis:
+        image: redis:7.2.0
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      # PostgreSQL for testing
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rec_engine_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      # Kafka for testing
+      zookeeper:
+        image: confluentinc/cp-zookeeper:latest
+        env:
+          ZOOKEEPER_CLIENT_PORT: 2181
+          ZOOKEEPER_TICK_TIME: 2000
+        ports:
+          - 2181:2181
+      
+      kafka:
+        image: confluentinc/cp-kafka:latest
+        env:
+          KAFKA_BROKER_ID: 1
+          KAFKA_ZOOKEEPER_CONNECT: localhost:2181
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd "kafka-topics --bootstrap-server localhost:9092 --list"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-test.txt
+      
+      - name: Wait for services
+        run: |
+          # Wait for Redis
+          timeout 30 bash -c 'until redis-cli ping; do sleep 1; done'
+          # Wait for PostgreSQL
+          timeout 30 bash -c 'until pg_isready -h localhost -p 5432; do sleep 1; done'
+          # Wait for Kafka
+          timeout 60 bash -c 'until kafka-topics --bootstrap-server localhost:9092 --list; do sleep 1; done'
+      
+      - name: Run integration tests
+        env:
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_DB: rec_engine_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+        run: |
+          python -m pytest tests/integration/ \
+            --cov=rec_engine \
+            --cov-report=xml \
+            --junit-xml=pytest-integration-results.xml \
+            -v
+      
+      - name: Upload integration test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: pytest-integration-results
+          path: |
+            pytest-integration-results.xml
+            coverage.xml
+          retention-days: 30
+
+  # Performance tests
+  performance-tests:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: [code-quality, unit-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-test.txt
+          pip install locust
+      
+      - name: Run performance tests
+        run: |
+          # Start the API server
+          python -m uvicorn app.api.main:app --host 0.0.0.0 --port 8000 &
+          API_PID=$!
+          
+          # Wait for server to start
+          sleep 10
+          
+          # Run performance tests
+          locust -f tests/performance/locustfile.py \
+            --host http://localhost:8000 \
+            --users 100 \
+            --spawn-rate 10 \
+            --run-time 60s \
+            --html performance-report.html \
+            --json performance-results.json \
+            --headless
+          
+          # Stop server
+          kill $API_PID
+          
+          # Check performance thresholds
+          LATENCY_P95=$(jq '.stats | map(select(.name == "/recommend")) | .[0].response_time_percentiles | ."95%"' performance-results.json)
+          if [ "$(echo "$LATENCY_P95 > 100" | bc -l)" -eq 1 ]; then
+            echo "P95 latency too high: ${LATENCY_P95}ms"
+            exit 1
+          fi
+      
+      - name: Upload performance results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-results
+          path: |
+            performance-report.html
+            performance-results.json
+          retention-days: 30
+
+  # Build Docker image
+  build-image:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [code-quality, unit-tests, integration-tests]
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            VCS_REF=${{ github.sha }}
+      
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+      
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          retention-days: 90
+
+  # Container security scanning
+  security-scan:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-image.outputs.image-tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Run Grype vulnerability scanner
+        uses: anchore/scan-action@v3
+        with:
+          image: ${{ needs.build-image.outputs.image-tag }}
+          format: sarif
+          output: grype-results.sarif
+      
+      - name: Upload Grype scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'grype-results.sarif'
+
+  # Deploy to staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-image, security-scan]
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+      
+      - name: Deploy to staging
+        run: |
+          # Update image tag in deployment
+          sed -i "s|rec-engine/api:.*|${{ needs.build-image.outputs.image-tag }}|g" infrastructure/kubernetes/api-deployment.yaml
+          
+          # Apply deployment
+          kubectl apply -f infrastructure/kubernetes/api-deployment.yaml -n rec-engine-staging
+          
+          # Wait for rollout
+          kubectl rollout status deployment/rec-engine-api -n rec-engine-staging --timeout=300s
+          
+          # Get deployment info
+          kubectl get pods -n rec-engine-staging -l app=rec-engine-api
+      
+      - name: Run smoke tests
+        run: |
+          # Wait for service to be ready
+          sleep 30
+          
+          # Run smoke tests
+          python -m pytest tests/smoke/ \
+            --base-url=https://staging.rec-engine.company.com \
+            -v
+      
+      - name: Post-deployment health check
+        run: |
+          # Check service health
+          curl -f https://staging.rec-engine.company.com/health || exit 1
+          
+          # Check metrics endpoint
+          curl -f https://staging.rec-engine.company.com/metrics || exit 1
+
+  # Deploy to production (canary)
+  deploy-production-canary:
+    name: Deploy to Production (Canary)
+    runs-on: ubuntu-latest
+    needs: [build-image, security-scan, deploy-staging]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+      
+      - name: Deploy canary
+        run: |
+          # Create canary deployment
+          sed "s/rec-engine-api/rec-engine-api-canary/g" infrastructure/kubernetes/api-deployment.yaml > canary-deployment.yaml
+          sed -i "s|rec-engine/api:.*|${{ needs.build-image.outputs.image-tag }}|g" canary-deployment.yaml
+          
+          # Scale down canary if exists
+          kubectl scale deployment rec-engine-api-canary --replicas=0 -n rec-engine-prod || true
+          
+          # Apply canary deployment
+          kubectl apply -f canary-deployment.yaml -n rec-engine-prod
+          
+          # Scale up canary
+          kubectl scale deployment rec-engine-api-canary --replicas=2 -n rec-engine-prod
+          
+          # Wait for canary to be ready
+          kubectl rollout status deployment/rec-engine-api-canary -n rec-engine-prod --timeout=300s
+      
+      - name: Configure traffic routing
+        run: |
+          # Update Istio virtual service for canary traffic (10%)
+          kubectl patch virtualservice rec-engine-api -n rec-engine-prod \
+            --type='json' \
+            -p='[{"op": "replace", "path": "/spec/http/0/route/0/weight", "value":90},
+                 {"op": "add", "path": "/spec/http/0/route/1", "value":{"destination":{"host":"rec-engine-api-canary","subset":"v2"},"weight":10}}]' || true
+      
+      - name: Monitor canary
+        run: |
+          # Monitor canary for 10 minutes
+          for i in {1..60}; do
+            echo "Checking canary health ($i/60)..."
+            
+            # Check canary pod health
+            CANARY_PODS=$(kubectl get pods -n rec-engine-prod -l app=rec-engine-api-canary --field-selector=status.phase=Running --no-headers | wc -l)
+            if [ "$CANARY_PODS" -lt 2 ]; then
+              echo "Canary pods not healthy"
+              exit 1
+            fi
+            
+            # Check error rates
+            ERROR_RATE=$(kubectl logs -n rec-engine-prod -l app=rec-engine-api-canary --since=1m | grep -c "ERROR" || echo "0")
+            if [ "$ERROR_RATE" -gt 10 ]; then
+              echo "High error rate in canary: $ERROR_RATE"
+              exit 1
+            fi
+            
+            sleep 10
+          done
+      
+      - name: Promote canary to production
+        run: |
+          # Gradually increase traffic
+          for weight in 25 50 75 100; do
+            echo "Promoting to $weight% traffic..."
+            kubectl patch virtualservice rec-engine-api -n rec-engine-prod \
+              --type='json' \
+              -p='[{"op": "replace", "path": "/spec/http/0/route/0/weight", "value":'$((100-weight))'},
+                   {"op": "replace", "path": "/spec/http/0/route/1/weight", "value":'$weight'}]'
+            sleep 60
+          done
+          
+          # Update main deployment
+          sed -i "s|rec-engine/api:.*|${{ needs.build-image.outputs.image-tag }}|g" infrastructure/kubernetes/api-deployment.yaml
+          kubectl apply -f infrastructure/kubernetes/api-deployment.yaml -n rec-engine-prod
+          
+          # Wait for main deployment
+          kubectl rollout status deployment/rec-engine-api -n rec-engine-prod --timeout=600s
+          
+          # Clean up canary
+          kubectl delete deployment rec-engine-api-canary -n rec-engine-prod
+      
+      - name: Post-deployment validation
+        run: |
+          # Run production smoke tests
+          python -m pytest tests/smoke/ \
+            --base-url=https://api.rec-engine.company.com \
+            -v
+          
+          # Check production metrics
+          curl -f https://api.rec-engine.company.com/health || exit 1
+          curl -f https://api.rec-engine.company.com/metrics || exit 1
+
+  # Rollback on failure
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: [deploy-production-canary]
+    if: failure() && needs.deploy-production-canary.result == 'failure'
+    environment: production
+    steps:
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+      
+      - name: Rollback deployment
+        run: |
+          echo "Rolling back deployment..."
+          kubectl rollout undo deployment/rec-engine-api -n rec-engine-prod
+          kubectl rollout status deployment/rec-engine-api -n rec-engine-prod --timeout=300s
+          
+          # Reset traffic routing
+          kubectl patch virtualservice rec-engine-api -n rec-engine-prod \
+            --type='json' \
+            -p='[{"op": "replace", "path": "/spec/http/0/route/0/weight", "value":100},
+                 {"op": "remove", "path": "/spec/http/0/route/1"}]' || true
+      
+      - name: Notify team
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          text: "🚨 Production deployment failed and rolled back!"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # Cleanup
+  cleanup:
+    name: Cleanup
+    runs-on: ubuntu-latest
+    needs: [deploy-production-canary, rollback]
+    if: always()
+    steps:
+      - name: Clean up old images
+        run: |
+          # Clean up old Docker images (keep last 10)
+          gh api repos/${{ github.repository }}/packages/container/${{ env.IMAGE_NAME }}/versions \
+            --jq '.[] | select(.metadata.container.tags | length == 0) | .id' | \
+            head -n -10 | \
+            xargs -I {} gh api --method DELETE repos/${{ github.repository }}/packages/container/${{ env.IMAGE_NAME }}/versions/{} || true
+      
+      - name: Clean up old artifacts
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+            });
+            
+            // Keep artifacts from last 5 runs
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: context.workflow,
+              per_page: 10,
+            });
+            
+            const cutoffRun = runs.data.workflow_runs[4];
+            if (cutoffRun) {
+              const oldArtifacts = artifacts.data.artifacts.filter(
+                artifact => new Date(artifact.created_at) < new Date(cutoffRun.created_at)
+              );
+              
+              for (const artifact of oldArtifacts) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+              }
+            }

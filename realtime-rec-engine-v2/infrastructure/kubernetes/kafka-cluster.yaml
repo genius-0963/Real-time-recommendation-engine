@@ -1,0 +1,683 @@
+# Production-grade Kafka cluster for Netflix/Meta scale streaming
+# Optimized for 10M+ events/sec with sub-second latency
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: rec-engine-kafka
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-kafka
+    component: streaming
+    tier: infrastructure
+  annotations:
+    strimzi.io/next-versions: "2.5.0"
+    strimzi.io/kafka-version: "3.5.0"
+spec:
+  # Kafka configuration
+  kafka:
+    version: 3.5.0
+    replicas: 6  # 6 brokers for high availability and throughput
+    image: "strimzi/kafka:0.35.0-kafka-3.5.0"
+    
+    # Storage configuration
+    storage:
+      type: persistent-claim
+      size: 1000Gi  # 1TB per broker for high throughput
+      class: "ebs-ssd-gp3"  # High-performance SSD storage
+    storageConfigs:
+    - type: persistent-claim
+      size: 1000Gi
+      class: "ebs-ssd-gp3"
+    
+    # JVM configuration optimized for high throughput
+    jvmOptions:
+      -Xms: "4G"           # Initial heap size
+      -Xmx: "8G"           # Max heap size (50% of total memory)
+      -XX:+UseG1GC        # G1 garbage collector for low latency
+      -XX:MaxGCPauseMillis: "20"  # Target GC pause time
+      -XX:G1HeapRegionSize: "16m"
+      -XX:+UseStringDeduplication
+      -XX:+OptimizeStringConcat
+      -XX:+UseCompressedOops
+      -Djava.security.egd=file:/dev/./urandom  # Faster random number generation
+    
+    # Resource allocation
+    resources:
+      requests:
+        memory: "16Gi"     # Total memory per broker
+        cpu: "4000m"       # 4 CPU cores
+      limits:
+        memory: "16Gi"
+        cpu: "8000m"       # 8 CPU cores max for burst handling
+    
+    # Listener configuration
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+      - name: external
+        port: 9094
+        type: loadbalancer
+        tls: true
+        configuration:
+          bootstrap:
+            loadBalancerIP: []  # Auto-assign IPs
+      - name: replication
+        port: 9095
+        type: internal
+        tls: true
+    
+    # Authorization
+    authorization:
+      type: simple
+      superUsers:
+      - CN=kafka-admin
+      - CN=rec-engine-service
+    
+    # Configuration optimized for high throughput
+    config:
+      # Performance tuning
+      num.network.threads: "8"
+      num.io.threads: "16"
+      socket.send.buffer.bytes: "102400"
+      socket.receive.buffer.bytes: "102400"
+      socket.request.max.bytes: "104857600"
+      queued.max.requests: "500"
+      queued.max.request.bytes: "52428800"
+      
+      # Log configuration for high throughput
+      num.partitions: "100"  # High partition count for parallelism
+      num.recovery.threads.per.data.dir: "4"
+      log.retention.hours: "168"  # 7 days retention
+      log.segment.bytes: "1073741824"  # 1GB segment size
+      log.retention.check.interval.ms: "300000"  # 5 minutes
+      log.flush.interval.messages: "10000"
+      log.flush.interval.ms: "1000"
+      
+      # Replication and durability
+      default.replication.factor: "3"
+      min.insync.replicas: "2"
+      replication.quota.window.num: "10000"
+      replication.quota.window.size.seconds: "30"
+      
+      # Compression for efficiency
+      compression.type: "snappy"
+      compression.lz4.level: "9"
+      
+      # Connection handling
+      connections.max.idle.ms: "600000"  # 10 minutes
+      max.connections: "100000"
+      max.connections.per.ip: "10000"
+      
+      # Request handling
+      request.timeout.ms: "30000"
+      fetch.max.wait.ms: "500"
+      fetch.max.bytes: "52428800"  # 50MB
+      
+      # Security
+      security.inter.broker.protocol.name: "SASL_PLAIN"
+      security.inter.broker.protocol.mechanism.inter.broker.protocol: "PLAIN"
+      listener.name.sasl_plaintext.plain.sasl.enabled.mechanisms: "PLAIN"
+      
+      # Monitoring
+      metric.reporters: "io.prometheus.JmxReporter"
+      jmx.port: "9997"
+      
+      # Zookeeper connection
+      zookeeper.connection.timeout.ms: "6000"
+      zookeeper.session.timeout.ms: "6000"
+      
+      # Topic auto-creation (disabled for production)
+      auto.create.topics.enable: "false"
+      
+      # Performance monitoring
+      kafka.metrics.polling.interval.secs: "10"
+      kafka.metrics.reporters.include: "org.apache.kafka.common.metrics.JmxReporter"
+    
+    # Rack awareness for fault tolerance
+    rack:
+      topologyKey: "failure-domain.beta.kubernetes.io/zone"
+    
+    # Pod templates
+    template:
+      metadata:
+        labels:
+          app: rec-engine-kafka
+          component: streaming
+        annotations:
+          # Monitoring
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "9997"
+          prometheus.io/path: "/metrics"
+          # Security
+          container.apparmor.security.beta.kubernetes.io/kafka: "runtime/default"
+      spec:
+        serviceAccountName: rec-engine-kafka
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: node-type
+                  operator: In
+                  values: ["io-optimized"]
+                - key: zone
+                  operator: In
+                  values: ["us-west-2a", "us-west-2b", "us-west-2c"]
+            preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                - key: node-role.kubernetes.io/worker
+                  operator: In
+                  values: ["worker"]
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["rec-engine-kafka"]
+                topologyKey: kubernetes.io/hostname
+        tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "kafka"
+          effect: "NoSchedule"
+        containers:
+        - name: kafka
+          # Additional environment variables
+          env:
+          - name: KAFKA_HEAP_OPTS
+            value: "-Xms4G -Xmx8G"
+          - name: KAFKA_JVM_PERFORMANCE_OPTS
+            value: "-server -XX:+UseG1GC -XX:MaxGCPauseMillis=20"
+          - name: KAFKA_OPTS
+            value: "-Djava.security.egd=file:/dev/./urandom"
+          # Resource limits
+          resources:
+            requests:
+              memory: "16Gi"
+              cpu: "4000m"
+            limits:
+              memory: "16Gi"
+              cpu: "8000m"
+          # Volume mounts
+          volumeMounts:
+          - name: data
+            mountPath: /var/lib/kafka/data
+          - name: logs
+            mountPath: /var/log/kafka
+          # Security context
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+              - ALL
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          # Liveness probe
+          livenessProbe:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - "bin/kafka-broker-api-versions --bootstrap-server localhost:9092"
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
+          # Readiness probe
+          readinessProbe:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - "bin/kafka-broker-api-versions --bootstrap-server localhost:9092"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+        volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: rec-engine-kafka-data
+        - name: logs
+          persistentVolumeClaim:
+            claimName: rec-engine-kafka-logs
+        nodeSelector:
+          node-type: io-optimized
+          zone: us-west-2a
+  
+  # Zookeeper configuration
+  zookeeper:
+    replicas: 3  # 3 nodes for quorum
+    image: "strimzi/kafka:0.35.0-kafka-3.5.0"
+    storage:
+      type: persistent-claim
+      size: 100Gi
+      class: "ebs-ssd-gp3"
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "500m"
+      limits:
+        memory: "4Gi"
+        cpu: "1000m"
+    jvmOptions:
+      -Xms: "512M"
+      -Xmx: "1G"
+      -XX:+UseG1GC
+      -XX:MaxGCPauseMillis: "20"
+    config:
+      # Performance tuning
+      tickTime: "2000"
+      initLimit: "10"
+      syncLimit: "5"
+      autopurge.snapRetainCount: "3"
+      autopurge.purgeInterval: "1"
+      maxClientCnxns: "10000"
+      maxSessionTimeout: "40000"
+      zookeeper.server.tickTime: "2000"
+      zookeeper.server.initLimit: "10"
+      zookeeper.server.syncLimit: "5"
+      zookeeper.server.maxClientCnxns: "10000"
+      zookeeper.server.maxSessionTimeout: "40000"
+    template:
+      spec:
+        serviceAccountName: rec-engine-zookeeper
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: node-type
+                  operator: In
+                  values: ["io-optimized"]
+        tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "zookeeper"
+          effect: "NoSchedule"
+        containers:
+        - name: zookeeper
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "1000m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+              - ALL
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          livenessProbe:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - "echo ruok | nc localhost 2181"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+          readinessProbe:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - "echo ruok | nc localhost 2181"
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+        volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: rec-engine-zookeeper-data
+        nodeSelector:
+          node-type: io-optimized
+  
+  # Entity Operator for topic management
+  entityOperator:
+    topicOperator:
+      watchedNamespace: "rec-engine-prod"
+      reconciliationIntervalSeconds: 90
+      topicMetadataMaxAttempts: 6
+    userOperator:
+      watchedNamespace: "rec-engine-prod"
+      reconciliationIntervalSeconds: 120
+      secretPrefix: "kafka-user-"
+    tlsSidecar:
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "100m"
+        limits:
+          memory: "128Mi"
+          cpu: "200m"
+  
+  # Cruise Control for cluster rebalancing
+  cruiseControl:
+    resources:
+      requests:
+        memory: "1Gi"
+        cpu: "500m"
+      limits:
+        memory: "2Gi"
+        cpu: "1000m"
+    config:
+      # Cruise Control configuration
+      default.goals: "RackAwareGoal,ReplicaDistributionGoal,DiskUsageGoal"
+      num.partition.metrics.windows: "5"
+      num.broker.metrics.windows: "5"
+      num.topic.metrics.windows: "5"
+      broker.metrics.window.ms: "300000"
+      topic.metrics.window.ms: "300000"
+      partition.metrics.window.ms: "300000"
+      self.healing.partition.exclude.topic.regex: "__.*"
+      self.healing.exclude.recently.brokers: "true"
+      self.healing.exclude.recently.brokers.ms: "300000"
+      metric.reporter.class: "org.apache.kafka.cruisecontrol.monitor.sampling.NoOpMetricReporter"
+      metrics.num.samples: "2"
+      metrics.sample.window.sec: "30"
+      # Performance optimizations
+      cruise.control.metrics.reporter.class: "org.apache.kafka.cruisecontrol.metricsreporter.CruiseControlMetricsReporter"
+      cruise.control.metrics.topic: "__CruiseControlMetrics"
+      cruise.control.metrics.reporter.ssl.truststore.location: "/tmp/cruise-control.truststore"
+      cruise.control.metrics.reporter.ssl.truststore.password: "password"
+      cruise.control.metrics.reporter.ssl.keystore.location: "/tmp/cruise-control.keystore"
+      cruise.control.metrics.reporter.ssl.keystore.password: "password"
+      cruise.control.metrics.reporter.ssl.key.password: "password"
+  
+  # Kafka Exporter for Prometheus monitoring
+  kafkaExporter:
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "200m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
+    config:
+      # Exporter configuration
+      kafka.server: "rec-engine-kafka-bootstrap:9092"
+      ssl.enabled: "true"
+      ssl.ca-file: "/etc/tls-sidecar/ca.crt"
+      ssl.keystore-file: "/etc/tls-sidecar/user.p12"
+      ssl.keystore-password: "password"
+      group.filter: ".*"
+      topic.filter: ".*"
+      logging.level: "INFO"
+      enable.sarama: "true"
+    template:
+      spec:
+        serviceAccountName: rec-engine-kafka-exporter
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+        tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "monitoring"
+          effect: "NoSchedule"
+
+---
+# PersistentVolumeClaim for Kafka data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rec-engine-kafka-data
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-kafka
+    component: streaming
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: "ebs-ssd-gp3"
+  resources:
+    requests:
+      storage: 1000Gi
+
+---
+# PersistentVolumeClaim for Kafka logs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rec-engine-kafka-logs
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-kafka
+    component: streaming
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: "ebs-ssd-gp3"
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+# PersistentVolumeClaim for Zookeeper data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rec-engine-zookeeper-data
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-zookeeper
+    component: streaming
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: "ebs-ssd-gp3"
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+# ServiceAccount for Kafka
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rec-engine-kafka
+  namespace: rec-engine-prod
+  annotations:
+    iam.amazonaws.com/role: arn:aws:iam::123456789012:role/rec-engine-kafka-role
+automountServiceAccountToken: true
+
+---
+# ServiceAccount for Zookeeper
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rec-engine-zookeeper
+  namespace: rec-engine-prod
+  annotations:
+    iam.amazonaws.com/role: arn:aws:iam::123456789012:role/rec-engine-zookeeper-role
+automountServiceAccountToken: true
+
+---
+# Kafka Topics
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: user-events
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-kafka
+    component: streaming
+spec:
+  partitions: 50  # High partition count for parallelism
+  replicas: 3
+  config:
+    retention.ms: "604800000"  # 7 days in milliseconds
+    segment.ms: "3600000"     # 1 hour segment size
+    cleanup.policy: "delete"
+    compression.type: "snappy"
+    max.message.bytes: "10485760"  # 10MB max message size
+    min.insync.replicas: "2"
+    enable.idempotence: "true"
+
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: interaction-events
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-kafka
+    component: streaming
+spec:
+  partitions: 100  # Higher partition count for high-volume events
+  replicas: 3
+  config:
+    retention.ms: "604800000"
+    segment.ms: "1800000"     # 30 minutes for high-throughput
+    cleanup.policy: "delete"
+    compression.type: "snappy"
+    max.message.bytes: "10485760"
+    min.insync.replicas: "2"
+    enable.idempotence: "true"
+
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: feature-updates
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-kafka
+    component: streaming
+spec:
+  partitions: 20
+  replicas: 3
+  config:
+    retention.ms: "259200000"  # 3 days for feature updates
+    segment.ms: "7200000"     # 2 hours
+    cleanup.policy: "delete"
+    compression.type: "snappy"
+    max.message.bytes: "10485760"
+    min.insync.replicas: "2"
+    enable.idempotence: "true"
+
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: model-updates
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-kafka
+    component: streaming
+spec:
+  partitions: 10
+  replicas: 3
+  config:
+    retention.ms: "86400000"   # 1 day for model updates
+    segment.ms: "14400000"    # 4 hours
+    cleanup.policy: "delete"
+    compression.type: "snappy"
+    max.message.bytes: "10485760"
+    min.insync.replicas: "2"
+    enable.idempotence: "true"
+
+---
+# Kafka Users
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: rec-engine-api
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-kafka
+    component: streaming
+spec:
+  authentication:
+    type: tls
+  authorization:
+    type: simple
+    acls:
+    - resource:
+        type: topic
+        name: user-events
+      operation: Write
+      host: "*"
+    - resource:
+        type: topic
+        name: interaction-events
+      operation: Write
+      host: "*"
+    - resource:
+        type: topic
+        name: feature-updates
+      operation: Write
+      host: "*"
+    - resource:
+        type: topic
+        name: model-updates
+      operation: Write
+      host: "*"
+    - resource:
+        type: topic
+        name: "*"
+      operation: Read
+      host: "*"
+  quotas:
+    consumerByteRate: "104857600"  # 100MB/s
+    producerByteRate: "104857600"  # 100MB/s
+    controllerMutationRate: "10"
+
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: rec-engine-consumer
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-kafka
+    component: streaming
+spec:
+  authentication:
+    type: tls
+  authorization:
+    type: simple
+    acls:
+    - resource:
+        type: topic
+        name: "*"
+      operation: Read
+      host: "*"
+  quotas:
+    consumerByteRate: "209715200"  # 200MB/s
+    controllerMutationRate: "10"

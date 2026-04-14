@@ -1,0 +1,706 @@
+# Canary deployment configuration for Netflix/Meta scale recommendation engine
+# Progressive traffic shifting with automated rollback and validation
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: rec-engine-api-canary
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-api
+    component: inference
+    deployment-strategy: canary
+  annotations:
+    argocd.argoproj.io/sync-options: CreateDelete=true
+    argocd.argoproj.io/compare-options: IgnoreExtraneousFields=true
+spec:
+  replicas: 10
+  strategy:
+    type: Canary
+    steps:
+    # Step 1: Deploy 10% canary
+    - setWeight: 10
+      pause: { duration: 5m }
+    # Step 2: Deploy 25% canary
+    - setWeight: 25
+      pause: { duration: 10m }
+    # Step 3: Deploy 50% canary
+    - setWeight: 50
+      pause: { duration: 15m }
+    # Step 4: Deploy 75% canary
+    - setWeight: 75
+      pause: { duration: 10m }
+    # Step 5: Full deployment
+    - setWeight: 100
+      pause: { duration: 5m }
+    
+    # Canary analysis
+    analysis:
+      templates:
+      - templateName: success-rate
+      - templateName: latency-check
+      - templateName: error-rate
+      args:
+      - name: service-name
+        value: rec-engine-api
+      - name: baseline-service
+        value: rec-engine-api-stable
+      - name: canary-service
+        value: rec-engine-api-canary
+      
+      # Starting step for analysis
+      startingStep: 2
+      interval: 2m
+      
+      # Analysis thresholds
+      threshold:
+        pass: 95
+        fail: 80
+      
+      # Rollback on failure
+      rollbackOnFailure: true
+      
+      # Number of successful analyses required
+      successfulRunHistoryLimit: 3
+      
+      # Number of failed analyses to trigger rollback
+      unsuccessfulRunHistoryLimit: 2
+  
+  # Revision history limit
+  revisionHistoryLimit: 5
+  
+  # Selector
+  selector:
+    matchLabels:
+      app: rec-engine-api
+      deployment-strategy: canary
+  
+  # Template
+  template:
+    metadata:
+      labels:
+        app: rec-engine-api
+        component: inference
+        deployment-strategy: canary
+        version: canary
+      annotations:
+        # Monitoring
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+        # Tracing
+        opentelemetry.io/instrumentation: "true"
+        # Security
+        container.apparmor.security.beta.kubernetes.io/rec-engine-api: "runtime/default"
+        container.seccomp.security.beta.kubernetes.io/rec-engine-api: "runtime/default"
+    spec:
+      # Service account
+      serviceAccountName: rec-engine-api
+      
+      # Security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      
+      # Affinity and anti-affinity
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-type
+                operator: In
+                values: ["compute-optimized"]
+              - key: zone
+                operator: In
+                values: ["us-west-2a", "us-west-2b", "us-west-2c"]
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["rec-engine-api"]
+              topologyKey: kubernetes.io/hostname
+          - weight: 50
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["rec-engine-api"]
+              topologyKey: topology.kubernetes.io/zone
+      
+      # Tolerations
+      tolerations:
+      - key: "workload"
+        operator: "Equal"
+        value: "rec-engine"
+        effect: "NoSchedule"
+      
+      # Init containers
+      initContainers:
+      - name: model-loader
+        image: rec-engine/model-loader:v2.0.0
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Loading models from S3..."
+            aws s3 cp s3://rec-engine-models/prod/latest/ /models/ --recursive
+            echo "Validating model integrity..."
+            python -m rec_engine.tools.validate_models --model-dir /models
+            echo "Models loaded successfully"
+        env:
+        - name: AWS_REGION
+          value: "us-west-2"
+        - name: MODEL_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: rec-engine-secrets
+              key: model-bucket
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"
+      
+      # Main container
+      containers:
+      - name: rec-engine-api
+        image: rec-engine/api:canary
+        imagePullPolicy: Always
+        
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+          successThreshold: 1
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+          successThreshold: 1
+        
+        # Environment variables
+        env:
+        - name: ENVIRONMENT
+          value: "production"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: METRICS_ENABLED
+          value: "true"
+        - name: TRACING_ENABLED
+          value: "true"
+        - name: DEPLOYMENT_STRATEGY
+          value: "canary"
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: rec-engine-config
+              key: redis-host
+        - name: REDIS_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: rec-engine-config
+              key: redis-port
+        - name: KAFKA_BROKERS
+          valueFrom:
+            configMapKeyRef:
+              name: rec-engine-config
+              key: kafka-brokers
+        - name: MODEL_PATH
+          value: "/models"
+        - name: JAEGER_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: rec-engine-config
+              key: jaeger-endpoint
+        - name: PROMETHEUS_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: rec-engine-config
+              key: prometheus-endpoint
+        # Secrets
+        - name: DATABASE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rec-engine-secrets
+              key: database-password
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rec-engine-secrets
+              key: redis-password
+        - name: KAFKA_SASL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rec-engine-secrets
+              key: kafka-sasl-password
+        
+        # Resource limits
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        
+        # Volume mounts
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+          readOnly: true
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+        - name: tmp-volume
+          mountPath: /tmp
+        - name: log-volume
+          mountPath: /app/logs
+        
+        # Security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+      
+      # Logging sidecar
+      - name: log-shipper
+        image: fluent/fluent-bit:v2.2.0
+        imagePullPolicy: Always
+        env:
+        - name: FLUENT_BIT_CONF
+          value: |
+            [SERVICE]
+                Flush        1
+                Daemon        off
+                Log_Level     info
+                Parsers_File  parsers.conf
+            [INPUT]
+                Name         tail
+                Path         /app/logs/*.log
+                Tag          rec-engine.*
+                Read_From_Head true
+            [OUTPUT]
+                Name  forward
+                Match *
+                Host  fluentd.logging.svc.cluster.local
+                Port  24224
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "$FLUENT_BIT_CONF" > /fluent-bit/etc/fluent-bit.conf
+            exec /fluent-bit/bin/fluent-bit --config=/fluent-bit/etc/fluent-bit.conf
+        volumeMounts:
+        - name: log-volume
+          mountPath: /app/logs
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+      
+      # Volumes
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: rec-engine-models-pvc
+      - name: config-volume
+        configMap:
+          name: rec-engine-config
+      - name: tmp-volume
+        emptyDir:
+          sizeLimit: 1Gi
+      - name: log-volume
+        emptyDir:
+          sizeLimit: 500Mi
+      
+      # Node selector
+      nodeSelector:
+        node-type: compute-optimized
+        zone: us-west-2a
+      
+      # Priority class
+      priorityClassName: high-priority
+      
+      # Termination grace period
+      terminationGracePeriodSeconds: 30
+
+---
+# Analysis templates for canary deployment
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+  namespace: rec-engine-prod
+spec:
+  args:
+  - name: service-name
+  - name: baseline-service
+  - name: canary-service
+  metrics:
+  - name: success-rate
+    interval: 30s
+    count: 10
+    successCondition: result[0] >= 0.95
+    failureLimit: 3
+    provider:
+      prometheus:
+        address: http://prometheus.rec-engine-prod.svc.cluster.local:9090
+        query: |
+          sum(rate(http_requests_total{service="{{args.service-name}}",status!~"5.."}[2m])) /
+          sum(rate(http_requests_total{service="{{args.service-name}}"}[2m]))
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: latency-check
+  namespace: rec-engine-prod
+spec:
+  args:
+  - name: service-name
+  - name: baseline-service
+  - name: canary-service
+  metrics:
+  - name: latency-p95
+    interval: 30s
+    count: 10
+    successCondition: result[0] <= 0.1
+    failureLimit: 3
+    provider:
+      prometheus:
+        address: http://prometheus.rec-engine-prod.svc.cluster.local:9090
+        query: |
+          histogram_quantile(0.95,
+            sum(rate(request_latency_seconds_bucket{service="{{args.service-name}}"}[2m])) by (le)
+          )
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: error-rate
+  namespace: rec-engine-prod
+spec:
+  args:
+  - name: service-name
+  - name: baseline-service
+  - name: canary-service
+  metrics:
+  - name: error-rate
+    interval: 30s
+    count: 10
+    successCondition: result[0] <= 0.01
+    failureLimit: 3
+    provider:
+      prometheus:
+        address: http://prometheus.rec-engine-prod.svc.cluster.local:9090
+        query: |
+          sum(rate(http_requests_total{service="{{args.service-name}}",status=~"5.."}[2m])) /
+          sum(rate(http_requests_total{service="{{args.service-name}}"}[2m]))
+
+---
+# Virtual service for traffic routing (Istio)
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: rec-engine-api
+  namespace: rec-engine-prod
+spec:
+  hosts:
+  - rec-engine-api
+  - rec-engine-api.rec-engine-prod.svc.cluster.local
+  gateways:
+  - rec-engine-api-gateway
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: rec-engine-api-stable
+        port:
+          number: 8000
+      weight: 100
+    - destination:
+        host: rec-engine-api-canary
+        port:
+          number: 8000
+      weight: 0
+    timeout: 30s
+    retries:
+      attempts: 3
+      perTryTimeout: 10s
+      retryOn: 5xx,gateway-error,connect-failure,refused-stream
+
+---
+# Destination rule for traffic routing
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: rec-engine-api
+  namespace: rec-engine-prod
+spec:
+  host: rec-engine-api
+  trafficPolicy:
+    loadBalancer:
+      simple: LEAST_CONN
+    connectionPool:
+      tcp:
+        maxConnections: 1000
+      http:
+        http1MaxPendingRequests: 1000
+        maxRequestsPerConnection: 100
+    circuitBreaker:
+      consecutiveErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+    outlierDetection:
+      consecutiveGatewayErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+      minHealthPercent: 50
+  subsets:
+  - name: stable
+    labels:
+      version: stable
+    trafficPolicy:
+      loadBalancer:
+        simple: ROUND_ROBIN
+  - name: canary
+    labels:
+      version: canary
+    trafficPolicy:
+      loadBalancer:
+        simple: ROUND_ROBIN
+
+---
+# Service for stable deployment
+apiVersion: v1
+kind: Service
+metadata:
+  name: rec-engine-api-stable
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-api
+    component: inference
+    version: stable
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+    protocol: TCP
+  selector:
+    app: rec-engine-api
+    version: stable
+
+---
+# Service for canary deployment
+apiVersion: v1
+kind: Service
+metadata:
+  name: rec-engine-api-canary
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-api
+    component: inference
+    version: canary
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+    protocol: TCP
+  selector:
+    app: rec-engine-api
+    version: canary
+
+---
+# Horizontal Pod Autoscaler for canary
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rec-engine-api-canary-hpa
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-api
+    component: inference
+    version: canary
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: rec-engine-api-canary
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: External
+    external:
+      metric:
+        name: recommendation_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "500"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 5
+        periodSeconds: 15
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+      selectPolicy: Min
+
+---
+# PodDisruptionBudget for canary
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rec-engine-api-canary-pdb
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-api
+    component: inference
+    version: canary
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: rec-engine-api
+      version: canary
+
+---
+# NetworkPolicy for canary
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rec-engine-api-canary-netpol
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-api
+    component: inference
+    version: canary
+spec:
+  podSelector:
+    matchLabels:
+      app: rec-engine-api
+      version: canary
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from: []
+    ports:
+    - protocol: TCP
+      port: 8000
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 8000
+  egress:
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis-cluster
+    ports:
+    - protocol: TCP
+      port: 6379
+  - to:
+    - podSelector:
+        matchLabels:
+          app: kafka-cluster
+    ports:
+    - protocol: TCP
+      port: 9092
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 80

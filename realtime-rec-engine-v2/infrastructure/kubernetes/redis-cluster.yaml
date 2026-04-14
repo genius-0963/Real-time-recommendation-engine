@@ -1,0 +1,627 @@
+# Production-grade Redis cluster for Netflix/Meta scale caching
+# Optimized for 10M+ QPS with sub-millisecond latency
+
+apiVersion: redis.redis.opstreelabs.io/v1beta1
+kind: RedisCluster
+metadata:
+  name: rec-engine-redis
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-redis
+    component: cache
+    tier: infrastructure
+  annotations:
+    redis.redis.opstreelabs.io/redis-version: "7.2.0"
+    redis.redis.opstreelabs.io/redis-image: "redis:7.2.0"
+spec:
+  # Cluster configuration
+  clusterSize: 6  # 6 nodes (3 masters + 3 replicas)
+  clusterVersion: v7.2.0
+  image: "redis:7.2.0"
+  
+  # Resource allocation
+  resources:
+    requests:
+      memory: "8Gi"      # Base memory for Redis
+      cpu: "2000m"       # 2 CPU cores for high QPS
+    limits:
+      memory: "16Gi"     # Upper memory limit
+      cpu: "4000m"       # 4 CPU cores max
+  
+  # Storage configuration
+  storage:
+    type: persistent-claim
+    size: 100Gi
+    class: "ebs-ssd-gp3"  # High-performance SSD
+  storageClassName: "ebs-ssd-gp3"
+  
+  # Redis configuration optimized for high throughput
+  redisConfig:
+    # Memory management
+    maxmemory: "12gb"
+    maxmemory-policy: "allkeys-lru"
+    maxmemory-samples: "5"
+    
+    # Persistence configuration
+    save: "900 1 300 10 60 10000"
+    appendonly: "yes"
+    appendfsync: "everysec"
+    auto-aof-rewrite-percentage: "100"
+    auto-aof-rewrite-min-size: "64mb"
+    
+    # Performance tuning
+    tcp-keepalive: "300"
+    tcp-backlog: "511"
+    timeout: "0"
+    
+    # Network optimization
+    tcp-user-timeout: "0"
+    tcp-keepalive: "300"
+    tcp-backlog: "511"
+    
+    # Client configuration
+    maxclients: "100000"
+    maxclients-per-connection: "10000"
+    
+    # Slow log configuration
+    slowlog-log-slower-than: "10000"  # 10ms threshold
+    slowlog-max-len: "128"
+    
+    # Memory optimization
+    hash-max-ziplist-entries: "512"
+    list-max-ziplist-size: "-2"
+    set-max-intset-entries: "512"
+    zset-max-ziplist-entries: "128"
+    
+    # Persistence optimization
+    rdbcompression: "yes"
+    rdbchecksum: "yes"
+    
+    # Security
+    requirepass: "your-redis-password"
+    rename-command: "CONFIG"
+    rename-command: "FLUSHDB"
+    rename-command: "FLUSHALL"
+    rename-command: "KEYS"
+    rename-command: "DEBUG"
+    rename-command: "EVAL"
+    
+    # Monitoring
+    latency-monitor-threshold: "100"
+    notify-keyspace-events: "Ex"
+    
+    # Cluster configuration
+    cluster-enabled: "yes"
+    cluster-config-file: "nodes.conf"
+    cluster-node-timeout: "5000"
+    cluster-announce-ip: "${POD_IP}"
+    cluster-announce-port: "6379"
+    cluster-announce-bus-port: "16379"
+    
+    # AOF persistence
+    aof-rewrite-incremental-fsync: "yes"
+    aof-load-truncated: "yes"
+    aof-use-rdb-preamble: "yes"
+  
+  # Pod template
+  podTemplate:
+    metadata:
+      labels:
+        app: rec-engine-redis
+        component: cache
+      annotations:
+        # Monitoring
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+        prometheus.io/path: "/metrics"
+        # Security
+        container.apparmor.security.beta.kubernetes.io/redis: "runtime/default"
+        # Performance
+        performance.alpha.kubernetes.io/cpu: "high"
+    spec:
+      serviceAccountName: rec-engine-redis
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        capabilities:
+          add:
+          - IPC_LOCK
+          - SYS_RESOURCE
+        drop:
+          - ALL
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: false
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-type
+                operator: In
+                values: ["memory-optimized"]
+              - key: zone
+                operator: In
+                values: ["us-west-2a", "us-west-2b", "us-west-2c"]
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: node-role.kubernetes.io/worker
+                operator: In
+                values: ["worker"]
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["rec-engine-redis"]
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+      - key: "workload"
+        operator: "Equal"
+        value: "redis"
+        effect: "NoSchedule"
+      containers:
+      - name: redis
+        image: "redis:7.2.0"
+        imagePullPolicy: Always
+        # Command and args
+        command:
+        - redis-server
+        args:
+        - /etc/redis/redis.conf
+        # Environment variables
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rec-engine-secrets
+              key: redis-password
+        # Resource limits
+        resources:
+          requests:
+            memory: "8Gi"
+            cpu: "2000m"
+          limits:
+            memory: "16Gi"
+            cpu: "4000m"
+        # Volume mounts
+        volumeMounts:
+        - name: conf
+          mountPath: /etc/redis
+          readOnly: true
+        - name: data
+          mountPath: /data
+        - name: logs
+          mountPath: /var/log/redis
+        - name: tmp
+          mountPath: /tmp
+        # Security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            add:
+            - IPC_LOCK
+            - SYS_RESOURCE
+            drop:
+            - ALL
+          runAsUser: 999
+          runAsGroup: 999
+        # Liveness probe
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - -a
+            - $(REDIS_PASSWORD)
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+        # Readiness probe
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - -a
+            - $(REDIS_PASSWORD)
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+          successThreshold: 1
+      # Redis exporter sidecar
+      - name: redis-exporter
+        image: oliver006/redis_exporter:v1.44.0
+        imagePullPolicy: Always
+        env:
+        - name: REDIS_ADDR
+          value: "redis://localhost:6379"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rec-engine-secrets
+              key: redis-password
+        - name: REDIS_EXPORTER_LOG_FORMAT
+          value: "json"
+        - name: REDIS_EXPORTER_INCL_SYSTEM_METRICS
+          value: "true"
+        command:
+        - redis_exporter
+        args:
+        - '--redis.addr=redis://localhost:6379'
+        - '--redis.password=$(REDIS_PASSWORD)'
+        - '--log-format=json'
+        - '--include-system-metrics'
+        ports:
+        - containerPort: 9121
+          name: metrics
+          protocol: TCP
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          capabilities:
+            drop:
+            - ALL
+      # Logging sidecar
+      - name: log-shipper
+        image: fluent/fluent-bit:v2.2.0
+        imagePullPolicy: Always
+        env:
+        - name: FLUENT_BIT_CONF
+          value: |
+            [SERVICE]
+                Flush        1
+                Daemon        off
+                Log_Level     info
+                Parsers_File  parsers.conf
+            [INPUT]
+                Name         tail
+                Path         /var/log/redis/*.log
+                Tag          redis.*
+                Read_From_Head true
+            [OUTPUT]
+                Name  forward
+                Match *
+                Host  fluentd.logging.svc.cluster.local
+                Port  24224
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "$FLUENT_BIT_CONF" > /fluent-bit/etc/fluent-bit.conf
+            exec /fluent-bit/bin/fluent-bit --config=/fluent-bit/etc/fluent-bit.conf
+        volumeMounts:
+        - name: logs
+          mountPath: /var/log/redis
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          capabilities:
+            drop:
+            - ALL
+      # Volumes
+      volumes:
+      - name: conf
+        configMap:
+          name: rec-engine-redis-config
+      - name: data
+        persistentVolumeClaim:
+          claimName: rec-engine-redis-data
+      - name: logs
+        persistentVolumeClaim:
+          claimName: rec-engine-redis-logs
+      - name: tmp
+        emptyDir:
+          sizeLimit: 1Gi
+      # Node selector
+      nodeSelector:
+        node-type: memory-optimized
+        zone: us-west-2a
+      # Priority class
+      priorityClassName: cache-priority
+      # Termination grace period
+      terminationGracePeriodSeconds: 30
+
+---
+# Redis configuration ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rec-engine-redis-config
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-redis
+    component: cache
+data:
+  redis.conf: |
+    # Basic configuration
+    bind 0.0.0.0
+    port 6379
+    protected-mode yes
+    requirepass your-redis-password
+    
+    # Memory management
+    maxmemory 12gb
+    maxmemory-policy allkeys-lru
+    maxmemory-samples 5
+    
+    # Persistence
+    save 900 1 300 10 60 10000
+    appendonly yes
+    appendfsync everysec
+    auto-aof-rewrite-percentage 100
+    auto-aof-rewrite-min-size 64mb
+    rdbcompression yes
+    rdbchecksum yes
+    aof-rewrite-incremental-fsync yes
+    aof-load-truncated yes
+    aof-use-rdb-preamble yes
+    
+    # Performance tuning
+    tcp-keepalive 300
+    tcp-backlog 511
+    timeout 0
+    tcp-user-timeout 0
+    
+    # Client configuration
+    maxclients 100000
+    maxclients-per-connection 10000
+    
+    # Slow log
+    slowlog-log-slower-than 10000
+    slowlog-max-len 128
+    
+    # Memory optimization
+    hash-max-ziplist-entries 512
+    list-max-ziplist-size -2
+    set-max-intset-entries 512
+    zset-max-ziplist-entries 128
+    
+    # Cluster configuration
+    cluster-enabled yes
+    cluster-config-file nodes.conf
+    cluster-node-timeout 5000
+    cluster-announce-ip ${POD_IP}
+    cluster-announce-port 6379
+    cluster-announce-bus-port 16379
+    
+    # Security
+    rename-command CONFIG ""
+    rename-command FLUSHDB ""
+    rename-command FLUSHALL ""
+    rename-command KEYS ""
+    rename-command DEBUG ""
+    rename-command EVAL ""
+    
+    # Monitoring
+    latency-monitor-threshold 100
+    notify-keyspace-events Ex
+    
+    # Logging
+    loglevel notice
+    syslog-enabled yes
+    syslog-ident redis
+    
+    # AOF configuration
+    aof-use-rdb-preamble yes
+    aof-rewrite-incremental-fsync yes
+
+---
+# ServiceAccount for Redis
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rec-engine-redis
+  namespace: rec-engine-prod
+  annotations:
+    iam.amazonaws.com/role: arn:aws:iam::123456789012:role/rec-engine-redis-role
+automountServiceAccountToken: true
+
+---
+# Service for Redis cluster
+apiVersion: v1
+kind: Service
+metadata:
+  name: rec-engine-redis
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-redis
+    component: cache
+  annotations:
+    # Service discovery
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    # Health check
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: "TCP"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "traffic-port"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-interval: "10"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-timeout: "5"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-healthy-threshold: "3"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-unhealthy-threshold: "3"
+spec:
+  type: LoadBalancer
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: 6379
+    protocol: TCP
+  - name: metrics
+    port: 9121
+    targetPort: 9121
+    protocol: TCP
+  selector:
+    app: rec-engine-redis
+  sessionAffinity: None
+
+---
+# Headless service for cluster discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: rec-engine-redis-headless
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-redis
+    component: cache
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless service
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: 6379
+    protocol: TCP
+  - name: cluster-bus
+    port: 16379
+    targetPort: 16379
+    protocol: TCP
+  selector:
+    app: rec-engine-redis
+  publishNotReadyAddresses: true
+
+---
+# PersistentVolumeClaim for Redis data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rec-engine-redis-data
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-redis
+    component: cache
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: "ebs-ssd-gp3"
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+# PersistentVolumeClaim for Redis logs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rec-engine-redis-logs
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-redis
+    component: cache
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: "ebs-ssd-gp3"
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# PriorityClass for cache workloads
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: cache-priority
+value: 750000
+globalDefault: false
+description: "High priority class for Redis cache workloads"
+
+---
+# NetworkPolicy for Redis
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rec-engine-redis-netpol
+  namespace: rec-engine-prod
+  labels:
+    app: rec-engine-redis
+    component: cache
+spec:
+  podSelector:
+    matchLabels:
+      app: rec-engine-redis
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow traffic from API services
+  - from:
+    - podSelector:
+        matchLabels:
+          app: rec-engine-api
+    ports:
+    - protocol: TCP
+      port: 6379
+  # Allow traffic from ANN service
+  - from:
+    - podSelector:
+        matchLabels:
+          app: rec-engine-ann
+    ports:
+    - protocol: TCP
+      port: 6379
+  # Allow traffic from feature store
+  - from:
+    - podSelector:
+        matchLabels:
+          app: rec-engine-feature-store
+    ports:
+    - protocol: TCP
+      port: 6379
+  # Allow traffic from monitoring
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 6379
+  egress:
+  # Allow DNS
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+  # Allow traffic to external services
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 80

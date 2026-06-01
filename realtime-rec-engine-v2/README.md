@@ -1072,16 +1072,6 @@ git push origin feature/amazing-feature
 This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
 
 ---
-
-## 📞 Support
-
-| Channel | Link |
-|---|---|
-| 📚 Documentation | [docs.rec-engine.company.com](https://docs.rec-engine.company.com) |
-| 💬 Slack | `#rec-engine-support` |
-| 📧 Email | rec-engine-team@company.com |
-| 🐛 Issues | [GitHub Issues](https://github.com/company/rec-engine/issues) |
-
 ---
 
 ## 🙏 Acknowledgments

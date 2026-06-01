@@ -1,0 +1,210 @@
+# OpenTelemetry configuration for Netflix/Meta scale recommendation engine
+# Distributed tracing across API, Redis, Kafka, ANN, and Feature Store
+
+receiver:
+  # Prometheus receiver for metrics
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: 'rec-engine-otel'
+          static_configs:
+            - targets: ['api-service:8000', 'ann-service:8080', 'feature-store:9000']
+          scrape_interval: 15s
+          metrics_path: /metrics
+
+  # Jaeger receiver for traces
+  jaeger:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:14250
+      thrift_http:
+        endpoint: 0.0.0.0:14268
+
+  # OTLP receiver for traces and metrics
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Zipkin receiver for legacy compatibility
+  zipkin:
+    endpoint: 0.0.0.0:9411
+
+processor:
+  # Batch processor for performance
+  batch:
+    send_batch_size: 1000
+    send_batch_max_size: 3000
+    timeout: 5s
+    metadata_keys_to_filter:
+      - token
+      - password
+      - secret
+      - api_key
+
+  # Memory limiter to prevent OOM
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+    ballast_size_mib: 64
+
+  # Resource processor to add common attributes
+  resource:
+    attributes:
+      - key: service.name
+        value: rec-engine-otel-collector
+        action: upsert
+      - key: environment
+        value: production
+        action: upsert
+      - key: cluster
+        value: us-west-2-prod
+        action: upsert
+
+  # Transform processor for data enrichment
+  transform:
+    # Add trace sampling information
+    trace_statements:
+      - context: trace
+        statements:
+          - set(attributes["sampler.type"], "probabilistic") where attributes["sampler.type"] == nil
+          - set(attributes["sampler.param"], "0.1") where attributes["sampler.param"] == nil
+
+    # Add resource attributes from environment
+    resource_statements:
+      - context: resource
+        statements:
+          - set(attributes["hostname"], env("HOST_NAME"))
+          - set(attributes["pod.name"], env("POD_NAME"))
+          - set(attributes["pod.namespace"], env("POD_NAMESPACE"))
+
+    # Filter sensitive data
+    metric_statements:
+      - where: name matches ".*password.*" or name matches ".*secret.*" or name matches ".*token.*"
+        action: delete
+
+    # Rename metrics for consistency
+    metric_statements:
+      - where: name == "http_requests_total"
+        statements:
+          - set(name, "http.server.requests")
+      - where: name == "http_request_duration_seconds"
+        statements:
+          - set(name, "http.server.request.duration")
+
+  # Span processor for trace enrichment
+  span:
+    name:
+      # Standardize span names
+      from_attributes: ["http.method", "http.route"]
+      separator: " "
+    # Add common attributes to spans
+    attributes:
+      - action: insert
+        key: service.instance.id
+        value: env("INSTANCE_ID")
+      - action: insert
+        key: service.version
+        value: env("SERVICE_VERSION")
+
+exporter:
+  # Prometheus exporter for metrics
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: "rec_engine"
+    const_labels:
+      environment: "production"
+      cluster: "us-west-2-prod"
+
+  # Jaeger exporter for traces
+  jaeger:
+    endpoint: jaeger-collector:14250
+    tls:
+      insecure: true
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 5000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  # OTLP exporter for cloud backends
+  otlp:
+    endpoint: "https://otel-collector.company.com:4317"
+    headers:
+      "x-api-key": "${OTEL_API_KEY}"
+    tls:
+      insecure: false
+      cert_file: "/etc/ssl/certs/client.crt"
+      key_file: "/etc/ssl/certs/client.key"
+      ca_file: "/etc/ssl/certs/ca.crt"
+    sending_queue:
+      enabled: true
+      num_consumers: 5
+      queue_size: 2500
+    retry_on_failure:
+      enabled: true
+
+  # Logging exporter for debugging
+  logging:
+    loglevel: info
+    sampling_initial: 5
+    sampling_thereafter: 100
+
+extensions:
+  # Health check extension
+  health_check:
+    endpoint: 0.0.0.0:13133
+    path: /health
+    response:
+      status: "ok"
+
+  # Performance profiling extension
+  pprof:
+    tcp:
+      endpoint: 0.0.0.0:1777
+
+  # ZPages extension for debugging
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  # Service telemetry pipeline
+  telemetry:
+    logs:
+      receivers: []
+    metrics:
+      receivers: [prometheus, otlp]
+      processors: [memory_limiter, batch, transform, resource]
+      exporters: [prometheus, otlp, logging]
+    traces:
+      receivers: [jaeger, otlp, zipkin]
+      processors: [memory_limiter, batch, transform, span, resource]
+      exporters: [jaeger, otlp]
+
+  # Service extensions
+  extensions: [health_check, pprof, zpages]
+
+  # Service pipeline for metrics only
+  pipelines:
+    metrics:
+      receivers: [prometheus, otlp]
+      processors: [memory_limiter, batch, transform, resource]
+      exporters: [prometheus, otlp]
+
+    traces:
+      receivers: [jaeger, otlp, zipkin]
+      processors: [memory_limiter, batch, transform, span, resource]
+      exporters: [jaeger, otlp]
+
+  # Enable all pipelines
+  enabled: true
+  enabled_signalfx: false
+  enabled_datadog: false
+  enabled_stackdriver: false

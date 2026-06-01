@@ -1,0 +1,429 @@
+# Production alert rules for Netflix/Meta scale recommendation engine
+# SLO-based alerting with error budgets and multi-level severity
+
+groups:
+  # API Performance Alerts
+  - name: api_performance
+    rules:
+      - alert: HighAPILatency
+        expr: histogram_quantile(0.95, rate(request_latency_seconds_bucket[5m])) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          service: rec-engine-api
+          team: ml-platform
+        annotations:
+          summary: "API P95 latency above 100ms threshold"
+          description: "P95 latency is {{ $value }}s for the last 5 minutes"
+          runbook_url: "https://runbooks.company.com/rec-engine/high-latency"
+          dashboard_url: "https://grafana.company.com/d/api-performance"
+
+      - alert: CriticalAPILatency
+        expr: histogram_quantile(0.95, rate(request_latency_seconds_bucket[2m])) > 0.5
+        for: 1m
+        labels:
+          severity: critical
+          service: rec-engine-api
+          team: ml-platform
+        annotations:
+          summary: "API P95 latency above 500ms - CRITICAL"
+          description: "P95 latency is {{ $value }}s for the last 2 minutes"
+          runbook_url: "https://runbooks.company.com/rec-engine/critical-latency"
+
+      - alert: HighAPIErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.01
+        for: 3m
+        labels:
+          severity: warning
+          service: rec-engine-api
+          team: ml-platform
+        annotations:
+          summary: "API error rate above 1%"
+          description: "Error rate is {{ $value | humanizePercentage }} for the last 5 minutes"
+
+      - alert: CriticalAPIErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[2m]) / rate(http_requests_total[2m]) > 0.05
+        for: 1m
+        labels:
+          severity: critical
+          service: rec-engine-api
+          team: ml-platform
+        annotations:
+          summary: "API error rate above 5% - CRITICAL"
+          description: "Error rate is {{ $value | humanizePercentage }} for the last 2 minutes"
+
+  # ANN Index Performance Alerts
+  - name: ann_index_performance
+    rules:
+      - alert: HighANNQueryLatency
+        expr: histogram_quantile(0.95, rate(ann_query_latency_seconds_bucket[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+          service: ann-index
+          team: ml-platform
+        annotations:
+          summary: "ANN query P95 latency above 50ms"
+          description: "ANN query latency is {{ $value }}s for the last 5 minutes"
+
+      - alert: ANNIndexCorruption
+        expr: ann_index_health_score < 0.95
+        for: 5m
+        labels:
+          severity: critical
+          service: ann-index
+          team: ml-platform
+        annotations:
+          summary: "ANN index health score degraded"
+          description: "Index health score is {{ $value }} - potential corruption detected"
+
+      - alert: ANNIndexRebuildNeeded
+        expr: ann_index_changes_since_rebuild / ann_index_total_items > 0.2
+        for: 10m
+        labels:
+          severity: info
+          service: ann-index
+          team: ml-platform
+        annotations:
+          summary: "ANN index needs rebuild"
+          description: "{{ $value | humanizePercentage }} of items changed since last rebuild"
+
+  # Cache Performance Alerts
+  - name: cache_performance
+    rules:
+      - alert: LowCacheHitRate
+        expr: rate(cache_hits_total[5m]) / (rate(cache_hits_total[5m]) + rate(cache_misses_total[5m])) < 0.8
+        for: 5m
+        labels:
+          severity: warning
+          service: redis-cache
+          team: ml-platform
+        annotations:
+          summary: "Cache hit rate below 80%"
+          description: "Cache hit rate is {{ $value | humanizePercentage }} for the last 5 minutes"
+
+      - alert: CriticalCacheHitRate
+        expr: rate(cache_hits_total[2m]) / (rate(cache_hits_total[2m]) + rate(cache_misses_total[2m])) < 0.5
+        for: 2m
+        labels:
+          severity: critical
+          service: redis-cache
+          team: ml-platform
+        annotations:
+          summary: "Cache hit rate below 50% - CRITICAL"
+          description: "Cache hit rate is {{ $value | humanizePercentage }} for the last 2 minutes"
+
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          service: redis-cache
+          team: ml-platform
+        annotations:
+          summary: "Redis memory usage above 90%"
+          description: "Redis memory usage is {{ $value | humanizePercentage }}"
+
+      - alert: RedisConnectionHigh
+        expr: redis_connected_clients > 1000
+        for: 3m
+        labels:
+          severity: warning
+          service: redis-cache
+          team: ml-platform
+        annotations:
+          summary: "Redis connections above 1000"
+          description: "Redis has {{ $value }} connected clients"
+
+  # Kafka Performance Alerts
+  - name: kafka_performance
+    rules:
+      - alert: KafkaConsumerLagHigh
+        expr: kafka_consumer_lag_sum > 10000
+        for: 2m
+        labels:
+          severity: warning
+          service: kafka
+          team: ml-platform
+        annotations:
+          summary: "Kafka consumer lag above 10k messages"
+          description: "Consumer lag is {{ $value }} messages"
+
+      - alert: KafkaConsumerLagCritical
+        expr: kafka_consumer_lag_sum > 50000
+        for: 1m
+        labels:
+          severity: critical
+          service: kafka
+          team: ml-platform
+        annotations:
+          summary: "Kafka consumer lag critical - 50k+ messages"
+          description: "Consumer lag is {{ $value }} messages - processing may be stalled"
+
+      - alert: KafkaBrokerDown
+        expr: up{job="kafka-cluster"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: kafka
+          team: ml-platform
+        annotations:
+          summary: "Kafka broker is down"
+          description: "Kafka broker {{ $labels.instance }} is not responding"
+
+      - alert: KafkaDiskSpaceHigh
+        expr: kafka_log_Log_Size / kafka_server_KafkaMetrics_Value{type="disk"} > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          service: kafka
+          team: ml-platform
+        annotations:
+          summary: "Kafka disk usage above 85%"
+          description: "Disk usage is {{ $value | humanizePercentage }} on {{ $labels.instance }}"
+
+  # Feature Store Alerts
+  - name: feature_store
+    rules:
+      - alert: FeatureStoreSyncLagHigh
+        expr: feature_store_sync_lag_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+          service: feature-store
+          team: ml-platform
+        annotations:
+          summary: "Feature store sync lag above 5 minutes"
+          description: "Sync lag is {{ $value }} seconds"
+
+      - alert: FeatureStoreSyncLagCritical
+        expr: feature_store_sync_lag_seconds > 1800
+        for: 2m
+        labels:
+          severity: critical
+          service: feature-store
+          team: ml-platform
+        annotations:
+          summary: "Feature store sync lag critical - 30+ minutes"
+          description: "Sync lag is {{ $value }} seconds - data may be stale"
+
+      - alert: FeatureStoreConnectionHigh
+        expr: feature_store_active_connections > 500
+        for: 3m
+        labels:
+          severity: warning
+          service: feature-store
+          team: ml-platform
+        annotations:
+          summary: "Feature store connections above 500"
+          description: "Active connections: {{ $value }}"
+
+  # Training Infrastructure Alerts
+  - name: training_infrastructure
+    rules:
+      - alert: GPUUtilizationLow
+        expr: avg(rate(nvidia_gpu_utilization_gpu[5m])) by (instance) < 0.3
+        for: 10m
+        labels:
+          severity: warning
+          service: training
+          team: ml-platform
+        annotations:
+          summary: "GPU utilization below 30%"
+          description: "GPU utilization is {{ $value | humanizePercentage }} on {{ $labels.instance }}"
+
+      - alert: GPUMemoryHigh
+        expr: nvidia_gpu_memory_used_bytes / nvidia_gpu_memory_total_bytes > 0.95
+        for: 5m
+        labels:
+          severity: warning
+          service: training
+          team: ml-platform
+        annotations:
+          summary: "GPU memory usage above 95%"
+          description: "GPU memory usage is {{ $value | humanizePercentage }} on {{ $labels.instance }}"
+
+      - alert: TrainingJobStalled
+        expr: increase(training_loss_total[10m]) == 0
+        for: 15m
+        labels:
+          severity: warning
+          service: training
+          team: ml-platform
+        annotations:
+          summary: "Training job appears stalled"
+          description: "No loss updates in the last 10 minutes for {{ $labels.job_name }}"
+
+      - alert: TrainingJobFailed
+        expr: training_job_status == 2
+        for: 0m
+        labels:
+          severity: critical
+          service: training
+          team: ml-platform
+        annotations:
+          summary: "Training job failed"
+          description: "Training job {{ $labels.job_name }} has failed"
+
+  # Model Performance & Drift Alerts
+  - name: model_performance
+    rules:
+      - alert: CTRDropSudden
+        expr: rate(clicks_total[5m]) / rate(impressions_total[5m]) < 0.8 * (rate(clicks_total[1h] offset 5m) / rate(impressions_total[1h] offset 5m))
+        for: 3m
+        labels:
+          severity: warning
+          service: model-performance
+          team: ml-platform
+        annotations:
+          summary: "CTR dropped suddenly"
+          description: "Current CTR is {{ $value | humanizePercentage }} of 1-hour average"
+
+      - alert: ModelDriftDetected
+        expr: model_drift_psi_score > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        service: model-performance
+        team: ml-platform
+        annotations:
+          summary: "Model drift detected"
+          description: "PSI score is {{ $value }} - threshold exceeded"
+
+      - alert: CriticalModelDrift
+        expr: model_drift_psi_score > 0.25
+        for: 2m
+        labels:
+          severity: critical
+          service: model-performance
+          team: ml-platform
+        annotations:
+          summary: "Critical model drift - retraining needed"
+          description: "PSI score is {{ $value }} - immediate retraining required"
+
+      - alert: ModelPredictionLatencyHigh
+        expr: histogram_quantile(0.95, rate(model_prediction_latency_seconds_bucket[5m])) > 0.2
+        for: 3m
+        labels:
+          severity: warning
+          service: model-performance
+          team: ml-platform
+        annotations:
+          summary: "Model prediction latency high"
+          description: "P95 prediction latency is {{ $value }}s"
+
+  # Infrastructure Alerts
+  - name: infrastructure
+    rules:
+      - alert: NodeCPUHigh
+        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 5m
+        labels:
+          severity: warning
+          service: infrastructure
+          team: ml-platform
+        annotations:
+          summary: "Node CPU usage above 85%"
+          description: "CPU usage is {{ $value }}% on {{ $labels.instance }}"
+
+      - alert: NodeMemoryHigh
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+          service: infrastructure
+          team: ml-platform
+        annotations:
+          summary: "Node memory usage above 90%"
+          description: "Memory usage is {{ $value }}% on {{ $labels.instance }}"
+
+      - alert: PodCrashLooping
+        expr: rate(kube_pod_container_status_restarts_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: kubernetes
+          team: ml-platform
+        annotations:
+          summary: "Pod is crash looping"
+          description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} is restarting frequently"
+
+      - alert: PodNotReady
+        expr: kube_pod_status_ready{condition="true"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          service: kubernetes
+          team: ml-platform
+        annotations:
+          summary: "Pod not ready"
+          description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} is not ready"
+
+  # Business Metrics Alerts
+  - name: business_metrics
+    rules:
+      - alert: RecommendationQPSDrop
+        expr: rate(recommendation_requests_total[5m]) < 0.8 * (rate(recommendation_requests_total[1h] offset 5m))
+        for: 3m
+        labels:
+          severity: warning
+          service: business
+          team: ml-platform
+        annotations:
+          summary: "Recommendation QPS dropped"
+          description: "Current QPS is {{ $value | humanizePercentage }} of 1-hour average"
+
+      - alert: RecommendationQPSCritical
+        expr: rate(recommendation_requests_total[2m]) < 0.5 * (rate(recommendation_requests_total[1h] offset 2m))
+        for: 1m
+        labels:
+          severity: critical
+          service: business
+          team: ml-platform
+        annotations:
+          summary: "Critical recommendation QPS drop"
+          description: "QPS dropped to {{ $value | humanizePercentage }} of normal"
+
+      - alert: LowEngagementRate
+        expr: rate(user_engagement_events_total[5m]) / rate(recommendation_requests_total[5m]) < 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: business
+          team: ml-platform
+        annotations:
+          summary: "Low engagement rate"
+          description: "Engagement rate is {{ $value | humanizePercentage }}"
+
+  # SLO-based alerts with error budget tracking
+  - name: slo_alerts
+    rules:
+      - alert: APIErrorBudgetBurnRateFast
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[5m])) /
+            sum(rate(http_requests_total[5m]))
+          ) > (1 - 0.999) / (30 * 24 * 3600) * 14 * 3600
+        for: 2m
+        labels:
+          severity: critical
+          service: rec-engine-api
+          slo: api-availability
+        annotations:
+          summary: "API error budget burning too fast"
+          description: "Error budget burn rate is {{ $value | humanizePercentage }} - SLO at risk"
+
+      - alert: APILatencySLOBreached
+        expr: |
+          (
+            sum(rate(request_latency_seconds_bucket{le="0.1"}[5m])) /
+            sum(rate(request_latency_seconds_count[5m]))
+          ) < 0.95
+        for: 5m
+        labels:
+          severity: critical
+          service: rec-engine-api
+          slo: api-latency
+        annotations:
+          summary: "API latency SLO breached"
+          description: "Only {{ $value | humanizePercentage }} of requests meet latency SLO"

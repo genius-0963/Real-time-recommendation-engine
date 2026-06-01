@@ -1,0 +1,197 @@
+# Prometheus configuration for Netflix/Meta scale recommendation engine
+# Optimized for high-cardinality metrics and long-term storage
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'rec-engine-prod'
+    region: 'us-west-2'
+    environment: 'production'
+
+# Rule files for alerting
+rule_files:
+  - "alert_rules.yaml"
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+      timeout: 10s
+      api_version: v2
+
+# Remote write configuration for long-term storage
+remote_write:
+  - url: "https://prometheus-remote-storage.company.com/api/v1/write"
+    queue_config:
+      max_samples_per_send: 10000
+      max_shards: 200
+      capacity: 25000
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'go_.*|process_.*|prometheus_.*'
+        action: drop
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+    scrape_interval: 30s
+    metrics_path: /metrics
+
+  # Recommendation API metrics
+  - job_name: 'rec-engine-api'
+    static_configs:
+      - targets: ['api-service:8000']
+    scrape_interval: 10s
+    scrape_timeout: 8s
+    metrics_path: /metrics
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '(.*)'
+        replacement: '${1}'
+    metric_relabel_configs:
+      # Drop high-cardinality debug metrics in production
+      - source_labels: [__name__]
+        regex: 'debug_.*'
+        action: drop
+
+  # ANN Index Service metrics
+  - job_name: 'ann-index-service'
+    static_configs:
+      - targets: ['ann-service:8080']
+    scrape_interval: 10s
+    scrape_timeout: 8s
+    metrics_path: /metrics
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'ann-index-1'
+
+  # Feature Store Service metrics
+  - job_name: 'feature-store-service'
+    static_configs:
+      - targets: ['feature-store:9000']
+    scrape_interval: 10s
+    scrape_timeout: 8s
+    metrics_path: /metrics
+
+  # Redis Cluster metrics
+  - job_name: 'redis-cluster'
+    static_configs:
+      - targets: 
+        - 'redis-node-1:9121'
+        - 'redis-node-2:9121'
+        - 'redis-node-3:9121'
+        - 'redis-node-4:9121'
+        - 'redis-node-5:9121'
+        - 'redis-node-6:9121'
+    scrape_interval: 15s
+    metrics_path: /metrics
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: 'redis-node-(.*):9121'
+        replacement: 'redis-node-${1}'
+
+  # Kafka Cluster metrics
+  - job_name: 'kafka-cluster'
+    static_configs:
+      - targets:
+        - 'kafka-broker-1:9308'
+        - 'kafka-broker-2:9308'
+        - 'kafka-broker-3:9308'
+    scrape_interval: 15s
+    metrics_path: /metrics
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: 'kafka-broker-(.*):9308'
+        replacement: 'kafka-broker-${1}'
+
+  # Training Job metrics
+  - job_name: 'training-jobs'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - rec-engine-training
+    relabel_configs:
+      # Select training pods
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: 'rec-engine-training'
+        action: keep
+      # Extract pod name as instance
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: instance
+      # Extract job name
+      - source_labels: [__meta_kubernetes_pod_label_job_name]
+        target_label: job_name
+    scrape_interval: 30s
+    scrape_timeout: 25s
+
+  # GPU metrics for training nodes
+  - job_name: 'gpu-metrics'
+    static_configs:
+      - targets: ['gpu-exporter:9400']
+    scrape_interval: 10s
+    metrics_path: /metrics
+
+  # Node exporter metrics for infrastructure monitoring
+  - job_name: 'node-exporter'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      # Select node exporter pods
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: 'node-exporter'
+        action: keep
+      # Extract node name
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        target_label: instance
+    scrape_interval: 30s
+
+  # Kubernetes API server metrics
+  - job_name: 'kubernetes-apiservers'
+    kubernetes_sd_configs:
+      - role: endpoints
+    scheme: https
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: default;kubernetes;https
+
+  # Container metrics
+  - job_name: 'cadvisor'
+    kubernetes_sd_configs:
+      - role: node
+    metrics_path: /metrics/cadvisor
+    scheme: https
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: node
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+
+# Storage configuration for optimized retention
+storage:
+  tsdb:
+    retention.time: 30d
+    retention.size: 50GB
+    wal-compression: true
+    
+# Compression for network efficiency
+compression: snappy

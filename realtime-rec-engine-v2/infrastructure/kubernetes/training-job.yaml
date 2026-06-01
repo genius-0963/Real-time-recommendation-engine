@@ -1,0 +1,559 @@
+# Distributed training job for Netflix/Meta scale recommendation engine
+# PyTorch DDP with multi-GPU support and fault tolerance
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rec-engine-training-job
+  namespace: rec-engine-training
+  labels:
+    app: rec-engine-training
+    component: training
+    job-type: distributed
+  annotations:
+    # Training metadata
+    training.job/type: "distributed_ddp"
+    training.job/model: "recommendation_v2"
+    training.job/dataset: "interactions_2024_q1"
+    # Scheduling annotations
+    batch.kubernetes.io/completion-index: "1"
+    batch.kubernetes.io/job-completion-index: "1"
+spec:
+  # Parallel job for distributed training
+  parallelism: 4  # Number of workers (adjust based on GPU availability)
+  completions: 4  # All workers must complete successfully
+  # Backoff policy for failed jobs
+  backoffLimit: 3
+  # Time limit for training job
+  activeDeadlineSeconds: 86400  # 24 hours
+  # Template for training pods
+  template:
+    metadata:
+      labels:
+        app: rec-engine-training
+        component: training
+        job-type: distributed
+      annotations:
+        # GPU monitoring
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9400"
+        prometheus.io/path: "/metrics"
+        # Training annotations
+        training.worker.id: "1"
+        training.job.uid: "12345"
+    spec:
+      # Service account with permissions for data access
+      serviceAccountName: rec-engine-training
+      # Restart policy for training pods
+      restartPolicy: Never
+      # Node affinity for GPU nodes
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: accelerator
+                operator: In
+                values: ["nvidia-tesla-v100", "nvidia-tesla-a100"]
+              - key: gpu-type
+                operator: In
+                values: ["v100", "a100"]
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: node-role.kubernetes.io/worker
+                operator: In
+                values: ["worker"]
+        # Pod anti-affinity for better resource distribution
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["rec-engine-training"]
+              topologyKey: kubernetes.io/hostname
+      # Init containers for setup
+      initContainers:
+      # Data validation and setup
+      - name: data-setup
+        image: rec-engine/data-processor:v2.0.0
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Setting up training data..."
+            # Validate data availability
+            aws s3 ls s3://rec-engine-data/training/interactions_2024_q1/
+            # Download metadata
+            aws s3 cp s3://rec-engine-data/training/interactions_2024_q1/metadata.json /data/
+            # Validate data integrity
+            python -m rec_engine.tools.validate_data --metadata /data/metadata.json
+            echo "Data setup completed"
+        env:
+        - name: AWS_REGION
+          value: "us-west-2"
+        - name: DATA_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: rec-engine-secrets
+              key: data-bucket
+        volumeMounts:
+        - name: data-volume
+          mountPath: /data
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+      # Model checkpoint validation
+      - name: checkpoint-setup
+        image: rec-engine/model-loader:v2.0.0
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Setting up model checkpoints..."
+            # Check if resuming from checkpoint
+            if [ "$RESUME_FROM_CHECKPOINT" = "true" ]; then
+              aws s3 cp s3://rec-engine-models/checkpoints/latest/ /checkpoints/ --recursive
+              echo "Loaded checkpoints for resume"
+            else
+              echo "Starting fresh training"
+            fi
+            # Validate checkpoint integrity
+            python -m rec_engine.tools.validate_checkpoints --checkpoint-dir /checkpoints
+            echo "Checkpoint setup completed"
+        env:
+        - name: RESUME_FROM_CHECKPOINT
+          value: "false"
+        - name: CHECKPOINT_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: rec-engine-secrets
+              key: checkpoint-bucket
+        volumeMounts:
+        - name: checkpoint-volume
+          mountPath: /checkpoints
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"
+      # Main training container
+      containers:
+      - name: training-container
+        image: rec-engine/training:v2.0.0
+        imagePullPolicy: Always
+        # Command for distributed training
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Starting distributed training worker..."
+            # Set up distributed training environment
+            export WORLD_SIZE=$K8S_POD_INDEX_COUNT
+            export RANK=$K8S_POD_INDEX
+            export MASTER_ADDR=$MASTER_ADDR
+            export MASTER_PORT=$MASTER_PORT
+            export LOCAL_RANK=$K8S_POD_INDEX
+            
+            echo "World Size: $WORLD_SIZE, Rank: $RANK, Local Rank: $LOCAL_RANK"
+            
+            # Initialize distributed process group
+            python -m torch.distributed.launch \
+              --nproc_per_node=1 \
+              --nnodes=$WORLD_SIZE \
+              --node_rank=$RANK \
+              --master_addr=$MASTER_ADDR \
+              --master_port=$MASTER_PORT \
+              training/distributed/train_ddp.py \
+              --config /app/config/training_config.yaml \
+              --resume_from_checkpoint $RESUME_FROM_CHECKPOINT \
+              --data_dir /data \
+              --checkpoint_dir /checkpoints \
+              --output_dir /output
+        # Environment variables
+        env:
+        - name: PYTHONPATH
+          value: "/app"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: NCCL_DEBUG
+          value: "INFO"
+        - name: OMP_NUM_THREADS
+          value: "4"
+        - name: K8S_POD_INDEX_COUNT
+          value: "4"
+        - name: K8S_POD_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - name: MASTER_ADDR
+          value: "rec-engine-training-master-0.rec-engine-training.svc.cluster.local"
+        - name: MASTER_PORT
+          value: "12355"
+        - name: RESUME_FROM_CHECKPOINT
+          value: "false"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: rec-engine-secrets
+              key: wandb-api-key
+        - name: MLFLOW_TRACKING_URI
+          valueFrom:
+            configMapKeyRef:
+              name: rec-engine-config
+              key: mlflow-tracking-uri
+        # GPU and performance settings
+        env:
+        - name: CUDA_LAUNCH_BLOCKING
+          value: "1"
+        - name: TORCH_CUDA_ARCH_LIST
+          value: "7.0;7.5;8.0;8.6"
+        - name: NCCL_SOCKET_IFNAME
+          value: "eth0"
+        # Resource requests and limits
+        resources:
+          requests:
+            memory: "16Gi"     # Memory for model, data, and gradients
+            cpu: "4000m"       # 4 CPU cores for data loading and preprocessing
+            nvidia.com/gpu: 1  # 1 GPU per worker
+          limits:
+            memory: "32Gi"     # Upper memory limit
+            cpu: "8000m"       # 8 CPU cores max
+            nvidia.com/gpu: 1  # 1 GPU max (adjust based on node capacity)
+            nvidia.com/gpu-memory: "32Gi"  # GPU memory limit
+        # Volume mounts
+        volumeMounts:
+        - name: data-volume
+          mountPath: /data
+          readOnly: true
+        - name: checkpoint-volume
+          mountPath: /checkpoints
+        - name: output-volume
+          mountPath: /output
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+        - name: shm-volume
+          mountPath: /dev/shm
+        - name: tmp-volume
+          mountPath: /tmp
+        # Security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+        # Liveness probe
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "ps aux | grep 'train_ddp.py' | grep -v grep || exit 1"
+          initialDelaySeconds: 300  # Wait 5 minutes for training to start
+          periodSeconds: 60
+          timeoutSeconds: 10
+          failureThreshold: 3
+          successThreshold: 1
+        # Readiness probe
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "python -c 'import torch; print(torch.cuda.is_available())' || exit 1"
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+      # GPU monitoring sidecar
+      - name: gpu-monitor
+        image: nvidia/k8s-gpu-monitor:v0.4.0
+        imagePullPolicy: Always
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: GPU_MONITOR_INTERVAL
+          value: "10"
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Starting GPU monitoring..."
+            /usr/bin/gpu-monitor --interval 10 --port 9400
+        ports:
+        - containerPort: 9400
+          name: gpu-metrics
+          protocol: TCP
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+      # Logging sidecar
+      - name: log-shipper
+        image: fluent/fluent-bit:v2.2.0
+        imagePullPolicy: Always
+        env:
+        - name: FLUENT_BIT_CONF
+          value: |
+            [SERVICE]
+                Flush        1
+                Daemon        off
+                Log_Level     info
+                Parsers_File  parsers.conf
+            [INPUT]
+                Name         tail
+                Path         /output/logs/*.log
+                Tag          training.*
+                Read_From_Head true
+            [OUTPUT]
+                Name  forward
+                Match *
+                Host  fluentd.logging.svc.cluster.local
+                Port  24224
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "$FLUENT_BIT_CONF" > /fluent-bit/etc/fluent-bit.conf
+            exec /fluent-bit/bin/fluent-bit --config=/fluent-bit/etc/fluent-bit.conf
+        volumeMounts:
+        - name: output-volume
+          mountPath: /output/logs
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+      # Volumes
+      volumes:
+      - name: data-volume
+        persistentVolumeClaim:
+          claimName: rec-engine-training-data-pvc
+      - name: checkpoint-volume
+        persistentVolumeClaim:
+          claimName: rec-engine-checkpoints-pvc
+      - name: output-volume
+        persistentVolumeClaim:
+          claimName: rec-engine-training-output-pvc
+      - name: config-volume
+        configMap:
+          name: rec-engine-training-config
+      - name: shm-volume
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi  # Shared memory for NCCL
+      - name: tmp-volume
+        emptyDir:
+          sizeLimit: 2Gi
+      # Node selector for GPU nodes
+      nodeSelector:
+        accelerator: nvidia-tesla-v100
+        gpu-type: v100
+        node-role.kubernetes.io/worker: "worker"
+      # Tolerations for GPU nodes
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "gpu-type"
+        operator: "Equal"
+        value: "v100"
+        effect: "NoSchedule"
+      # Priority class
+      priorityClassName: training-priority
+      # Termination grace period
+      terminationGracePeriodSeconds: 300  # 5 minutes for graceful shutdown
+
+---
+# Headless service for distributed training communication
+apiVersion: v1
+kind: Service
+metadata:
+  name: rec-engine-training-master
+  namespace: rec-engine-training
+  labels:
+    app: rec-engine-training
+    component: training
+    role: master
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless service for DNS-based discovery
+  ports:
+  - name: master-port
+    port: 12355
+    targetPort: 12355
+    protocol: TCP
+  selector:
+    app: rec-engine-training
+    component: training
+    role: master
+  publishNotReadyAddresses: true
+
+---
+# ConfigMap for training configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rec-engine-training-config
+  namespace: rec-engine-training
+  labels:
+    app: rec-engine-training
+    component: training
+data:
+  training_config.yaml: |
+    # Distributed training configuration
+    training:
+      backend: "nccl"
+      world_size: 4
+      batch_size: 2048
+      num_epochs: 100
+      learning_rate: 0.001
+      weight_decay: 1e-5
+      warmup_epochs: 5
+      save_every_n_steps: 1000
+      eval_every_n_steps: 500
+      early_stopping_patience: 10
+      gradient_clipping: 1.0
+      mixed_precision: true
+      gradient_accumulation_steps: 1
+    
+    model:
+      embedding_dim: 128
+      hidden_layers: [512, 256, 128]
+      dropout_rate: 0.2
+      num_heads: 8
+      num_negatives: 5
+      temperature: 0.1
+    
+    data:
+      train_data_path: "/data/train"
+      val_data_path: "/data/val"
+      test_data_path: "/data/test"
+      num_workers: 4
+      pin_memory: true
+      persistent_workers: true
+      prefetch_factor: 2
+    
+    checkpoints:
+      checkpoint_dir: "/checkpoints"
+      save_top_k: 3
+      monitor_metric: "val_auc"
+      mode: "max"
+    
+    logging:
+      log_level: "INFO"
+      log_interval: 100
+      wandb_project: "rec-engine-training"
+      mlflow_experiment: "recommendation_v2"
+    
+    # Resource optimization
+    optimization:
+      use_amp: true
+      find_unused_parameters: true
+      broadcast_buffers: false
+      gradient_as_bucket_view: false
+    
+    # Fault tolerance
+    fault_tolerance:
+      auto_resume: true
+      checkpoint_interval: 1000
+      max_retries: 3
+      retry_delay: 60
+
+---
+# ServiceAccount for training job
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rec-engine-training
+  namespace: rec-engine-training
+  annotations:
+    iam.amazonaws.com/role: arn:aws:iam::123456789012:role/rec-engine-training-role
+automountServiceAccountToken: true
+
+---
+# PriorityClass for training workloads
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: training-priority
+value: 500000
+globalDefault: false
+description: "High priority class for distributed training workloads"
+
+---
+# PersistentVolumeClaim for training data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rec-engine-training-data-pvc
+  namespace: rec-engine-training
+  labels:
+    app: rec-engine-training
+    component: training
+spec:
+  accessModes:
+  - ReadOnlyMany
+  storageClassName: "efs-ssd"  # High-performance storage
+  resources:
+    requests:
+      storage: 500Gi  # Adjust based on dataset size
+
+---
+# PersistentVolumeClaim for checkpoints
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rec-engine-checkpoints-pvc
+  namespace: rec-engine-training
+  labels:
+    app: rec-engine-training
+    component: training
+spec:
+  accessModes:
+  - ReadWriteMany
+  storageClassName: "efs-ssd"
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+# PersistentVolumeClaim for output
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rec-engine-training-output-pvc
+  namespace: rec-engine-training
+  labels:
+    app: rec-engine-training
+    component: training
+spec:
+  accessModes:
+  - ReadWriteMany
+  storageClassName: "efs-ssd"
+  resources:
+    requests:
+      storage: 50Gi

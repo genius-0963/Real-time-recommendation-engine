@@ -1,0 +1,6 @@
+apiVersion: v2
+name: rec-engine
+description: Real-time recommendation engine with streaming ML pipeline
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

@@ -1,0 +1,94 @@
+# Default values for rec-engine
+replicaCount: 3
+
+image:
+  repository: rec-engine
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+  hosts:
+    - host: rec-engine.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 50
+  targetCPUUtilizationPercentage: 70
+
+env:
+  ENVIRONMENT: production
+  REDIS_URL: redis://redis:6379/0
+  DATABASE_URL: postgresql://rec_user:rec_pass@postgres:5432/rec_engine
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  API_HOST: "0.0.0.0"
+  API_PORT: "8000"
+  API_WORKERS: "4"
+  API_LOG_LEVEL: info
+  MONITORING_LOG_LEVEL: INFO
+  MONITORING_LOG_FORMAT: json
+  MODEL_INDEX_TYPE: scann
+  FEATURE_STORE_ONLINE_STORE: redis
+  FEATURE_STORE_OFFLINE_STORE: postgres
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8000"
+  prometheus.io/path: /metrics
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 30
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 10
+  periodSeconds: 5

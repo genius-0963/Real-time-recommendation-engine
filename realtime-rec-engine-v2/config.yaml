@@ -1,0 +1,70 @@
+# Real-Time Recommendation Engine Configuration
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  debug: false
+
+model:
+  embedding_dim: 128
+  hidden_layers: [512, 256, 128]
+  num_heads: 8
+  num_negatives: 5
+  temperature: 0.1
+  dropout: 0.1
+
+redis:
+  host: "localhost"
+  port: 6379
+  password: ""
+  db: 0
+  pool_size: 20
+  default_ttl: 3600
+
+database:
+  host: "localhost"
+  port: 5432
+  name: "rec_engine"
+  user: "rec_user"
+  password: "rec_pass"
+  pool_size: 10
+  max_overflow: 20
+
+kafka:
+  bootstrap_servers:
+    - "localhost:9092"
+  schema_registry_url: "http://localhost:8081"
+  consumer_group: "rec-engine-consumer"
+  topic_prefix: "rec-engine"
+  user_events_topic: "user-events"
+  item_events_topic: "item-events"
+  interaction_events_topic: "interaction-events"
+  feature_updates_topic: "feature-updates"
+
+feature_store:
+  sync_interval: 300
+  batch_size: 1000
+  online_store: "redis"
+  offline_store: "postgres"
+
+index:
+  type: "scann"
+  dim: 128
+  num_neighbors: 10
+  num_leaves: 2000
+  num_leaves_to_search: 200
+
+training:
+  batch_size: 2048
+  epochs: 100
+  learning_rate: 0.001
+  mixed_precision: true
+  checkpoint_dir: "/tmp/checkpoints"
+
+monitoring:
+  prometheus_port: 9090
+  jaeger_endpoint: "http://localhost:14268/api/traces"
+  otel_endpoint: "http://localhost:4317"
+  log_level: "INFO"
+  tracing_sample_rate: 0.1

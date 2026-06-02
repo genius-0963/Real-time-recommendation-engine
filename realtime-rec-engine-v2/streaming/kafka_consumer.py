@@ -456,18 +456,66 @@ class EventProcessor:
     
     async def _update_user_interaction_history(self, user_id: str, item_id: str, event_type: str):
         """Update user interaction history."""
-        # Implementation would depend on feature store
-        pass
+        try:
+            interaction_key = f"user:{user_id}:interactions"
+            interaction = json.dumps({
+                'item_id': item_id,
+                'event_type': event_type,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+            # Append to interaction list and trim to last 100
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: (
+                    self.feature_store.rpush(interaction_key, interaction),
+                    self.feature_store.ltrim(interaction_key, -100, -1)
+                )
+            )
+            # Update interaction count
+            count_key = f"user:{user_id}:interaction_count"
+            await asyncio.get_event_loop().run_in_executor(
+                None, self.feature_store.incr, count_key
+            )
+            logger.info(f"Updated interaction history for user {user_id}: {event_type} on {item_id}")
+        except Exception as e:
+            logger.error(f"Failed to update interaction history for user {user_id}: {e}")
     
     async def _update_user_preferences(self, user_id: str, event_data: Dict[str, Any]):
         """Update user preferences based on event."""
-        # Implementation would depend on feature store
-        pass
+        try:
+            item_category = event_data.get('item_category', 'unknown')
+            event_type = event_data.get('event_type', 'view')
+            
+            # Event type weights
+            weights = {'view': 1.0, 'click': 2.0, 'add_to_cart': 5.0, 'purchase': 10.0}
+            weight = weights.get(event_type, 1.0)
+            
+            # Update category preference counter
+            pref_key = f"user:{user_id}:preferences"
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                self.feature_store.hincrbyfloat, pref_key, item_category, weight
+            )
+            logger.info(f"Updated preferences for user {user_id}: {item_category} +{weight}")
+        except Exception as e:
+            logger.error(f"Failed to update preferences for user {user_id}: {e}")
     
     async def _update_features(self, entity_type: str, entity_id: str, features: Dict[str, Any]):
         """Update features in feature store."""
-        # Implementation would depend on feature store
-        pass
+        try:
+            feature_key = f"{entity_type}:{entity_id}:features"
+            feature_data = json.dumps(features) if isinstance(features, dict) else str(features)
+            
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: (
+                    self.feature_store.set(feature_key, feature_data),
+                    self.feature_store.expire(feature_key, 3600)  # 1 hour TTL
+                )
+            )
+            logger.info(f"Updated features for {entity_type}:{entity_id}: {len(features)} features")
+        except Exception as e:
+            logger.error(f"Failed to update features for {entity_type}:{entity_id}: {e}")
 
 
 # Example usage

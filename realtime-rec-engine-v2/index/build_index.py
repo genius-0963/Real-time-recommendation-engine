@@ -504,16 +504,44 @@ class DistributedIndexBuilder:
                        full_embeddings: np.ndarray, full_item_ids: List[str]) -> BaseANNIndex:
         """Merge partial indexes into final index."""
         try:
-            # For now, rebuild with full data (could be optimized)
-            if self.config.index_type == 'scann':
-                final_index = ScaNNIndex(self.config)
+            if self.config.index_type == 'faiss' and FAISS_AVAILABLE:
+                # FAISS supports native index merging for IVF-based indexes
+                logger.info("Merging FAISS partial indexes natively")
+                
+                # Use the first partial index as the base
+                base_index = partial_indexes[0]
+                
+                if hasattr(base_index.index, 'merge_from'):
+                    for partial_index in partial_indexes[1:]:
+                        base_index.index.merge_from(partial_index.index)
+                    
+                    # Update item_ids to include all partials
+                    merged_item_ids = []
+                    for partial in partial_indexes:
+                        merged_item_ids.extend(partial.item_ids)
+                    base_index.item_ids = merged_item_ids
+                    base_index.is_built = True
+                    
+                    logger.info(f"Merged {len(partial_indexes)} FAISS indexes ({len(merged_item_ids)} total items)")
+                    return base_index
+                else:
+                    # Fallback: HNSW and other non-IVF indexes don't support merge
+                    logger.info("FAISS index type does not support merge_from, rebuilding from full data")
+                    final_index = FAISSIndex(self.config)
+                    final_index.build(full_embeddings, full_item_ids)
+                    return final_index
             else:
-                final_index = FAISSIndex(self.config)
-            
-            final_index.build(full_embeddings, full_item_ids)
-            
-            return final_index
-            
+                # ScaNN does not support native index merging.
+                # Rebuild from full data as the only available approach.
+                logger.info("Rebuilding full index (ScaNN does not support native merge)")
+                if self.config.index_type == 'scann':
+                    final_index = ScaNNIndex(self.config)
+                else:
+                    final_index = FAISSIndex(self.config)
+                
+                final_index.build(full_embeddings, full_item_ids)
+                return final_index
+                
         except Exception as e:
             logger.error(f"Failed to merge indexes: {e}")
             raise

@@ -356,19 +356,34 @@ class FeatureSyncPipeline:
     def _get_entity_types(self) -> List[str]:
         """Get all entity types from offline store."""
         try:
-            # This would typically query the offline store for distinct entity types
-            # For now, return common types
+            from sqlalchemy import text
+            with self.offline_store.engine.connect() as conn:
+                result = conn.execute(
+                    text("SELECT DISTINCT entity_type FROM feature_store.feature_values ORDER BY entity_type")
+                )
+                entity_types = [row[0] for row in result]
+            if entity_types:
+                return entity_types
+            # Fallback to common types if table is empty
             return ['user', 'item', 'session']
         except Exception as e:
             logger.error(f"Failed to get entity types: {e}")
-            return []
+            # Fallback to common types on error
+            return ['user', 'item', 'session']
     
     def _get_entity_ids(self, entity_type: str, limit: int = 10000) -> List[str]:
         """Get entity IDs for a specific type."""
         try:
-            # This would typically query the offline store for entity IDs
-            # For now, return sample IDs
-            return [f"{entity_type}_{i}" for i in range(1000)]
+            from sqlalchemy import text
+            with self.offline_store.engine.connect() as conn:
+                result = conn.execute(
+                    text("SELECT DISTINCT entity_id FROM feature_store.feature_values WHERE entity_type = :entity_type ORDER BY entity_id LIMIT :limit"),
+                    {"entity_type": entity_type, "limit": limit}
+                )
+                entity_ids = [row[0] for row in result]
+            if entity_ids:
+                return entity_ids
+            return []
         except Exception as e:
             logger.error(f"Failed to get entity IDs for {entity_type}: {e}")
             return []

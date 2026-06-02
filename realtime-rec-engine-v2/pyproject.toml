@@ -1,0 +1,37 @@
+[project]
+name = "realtime-rec-engine"
+version = "1.0.0"
+description = "Real-time recommendation engine with streaming ML pipeline, online feature store, and sub-100ms inference"
+requires-python = ">=3.9"
+authors = [
+    { name = "Rec Engine Team" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests requiring external services",
+    "slow: Slow tests that should be run separately",
+    "gpu: Tests requiring GPU",
+]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.bandit]
+exclude_dirs = ["tests", "venv"]

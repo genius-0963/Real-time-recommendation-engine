@@ -1,0 +1,94 @@
+version: '3.8'
+services:
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yaml:/etc/prometheus/prometheus.yml
+      - ./monitoring/alert_rules.yaml:/etc/prometheus/alert_rules.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    networks:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/rec-engine.json
+    volumes:
+      - ./monitoring/grafana_dashboard.json:/var/lib/grafana/dashboards/rec-engine.json
+      - ./monitoring/grafana-datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml
+      - ./monitoring/grafana-dashboard-provider.yml:/etc/grafana/provisioning/dashboards/provider.yml
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - monitoring
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.50
+    ports:
+      - "16686:16686"  # UI
+      - "14268:14268"  # Collector HTTP
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - monitoring
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.88.0
+    ports:
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+      - "8889:8889"    # Prometheus exporter
+    volumes:
+      - ./monitoring/otel_config.yaml:/etc/otelcol/config.yaml
+    command: ['--config=/etc/otelcol/config.yaml']
+    depends_on:
+      - jaeger
+      - prometheus
+    networks:
+      - monitoring
+
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    ports:
+      - "9100:9100"
+    networks:
+      - monitoring
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.55.0
+    ports:
+      - "9121:9121"
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+    networks:
+      - monitoring
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    ports:
+      - "9308:9308"
+    command:
+      - '--kafka.server=kafka:9092'
+    networks:
+      - monitoring
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  monitoring:
+    driver: bridge

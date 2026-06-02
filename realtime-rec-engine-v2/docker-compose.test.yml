@@ -1,0 +1,76 @@
+version: "3.9"
+
+# Minimal service set for integration tests.
+# Usage: docker compose -f docker-compose.test.yml up -d
+
+services:
+  redis:
+    image: redis:7.2-alpine
+    container_name: rec-engine-test-redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    networks:
+      - rec-engine-test-network
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: rec-engine-test-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: rec_engine_test
+      POSTGRES_USER: rec_user
+      POSTGRES_PASSWORD: rec_pass
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rec_user -d rec_engine_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    networks:
+      - rec-engine-test-network
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: rec-engine-test-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - rec-engine-test-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: rec-engine-test-kafka
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    networks:
+      - rec-engine-test-network
+
+networks:
+  rec-engine-test-network:
+    driver: bridge
+    name: rec-engine-test-network

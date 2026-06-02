@@ -1,0 +1,155 @@
+version: "3.9"
+
+services:
+  # ─── Data Stores ────────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: rec-engine-redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+        --maxmemory 2gb
+        --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_data:/data
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: rec-engine-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: rec_engine
+      POSTGRES_USER: rec_user
+      POSTGRES_PASSWORD: rec_pass
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rec_user -d rec_engine"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+  # ─── Kafka Ecosystem ───────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: rec-engine-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: rec-engine-kafka
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: rec-engine-schema-registry
+    ports:
+      - "8081:8081"
+    depends_on:
+      - kafka
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+  # ─── Observability ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: rec-engine-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert_rules.yaml:/etc/prometheus/alert_rules.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: rec-engine-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.50
+    container_name: rec-engine-jaeger
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "14268:14268"   # Collector HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+# ─── Volumes ───────────────────────────────────────────────────
+volumes:
+  redis_data:
+    driver: local
+  postgres_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+# ─── Networks ──────────────────────────────────────────────────
+networks:
+  rec-engine-network:
+    driver: bridge
+    name: rec-engine-network

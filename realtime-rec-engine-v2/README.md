@@ -187,47 +187,68 @@ graph LR
 realtime-rec-engine-v2/
 │
 ├── 📦 app/                              # Core API application
-│   ├── config.py                        # Centralized config (dataclasses, env-based)
+│   ├── config.py                        # Centralized config (9 dataclasses, env-based)
 │   └── api/
 │       └── main.py                      # FastAPI app: 15 endpoints, CORS, GZip, OTel, lifespan
 │
 ├── 🧠 training/                         # Distributed ML training
-│   ├── model.py                         # Two-Tower neural network (multi-head attention, contrastive loss)
-│   ├── data_pipeline.py                 # PostgreSQL → Pandas → DataLoader with train/val/test split
 │   └── distributed/
+│       ├── model.py                     # Two-Tower neural network (multi-head attention, contrastive loss)
+│       ├── dataset.py                   # Dataset utilities
+│       ├── launcher.py                  # Training job launcher
 │       └── train_ddp.py                 # PyTorch DDP: multi-GPU, mixed precision, MLflow + W&B
 │
 ├── 🔍 index/                            # ANN vector search engine
-│   ├── build_index.py                   # ScaNN/FAISS index builder with metadata tracking
+│   ├── build_index.py                   # ScaNN/FAISS index builder + native FAISS merge
 │   ├── benchmark.py                     # Recall@K, latency percentiles, QPS benchmarking
 │   └── incremental_update.py            # Real-time add/remove, auto-rebuild on >20% drift
 │
 ├── 📡 streaming/                        # Kafka event streaming pipeline
 │   ├── kafka_producer.py                # Avro serialization, batching, dead letter queue
-│   ├── kafka_consumer.py                # Consumer groups, exactly-once, batch processing, DLQ
+│   ├── kafka_consumer.py                # Consumer groups, exactly-once, EventProcessor logic
+│   ├── schema_registry.py              # Schema management
 │   └── stream_processor.py             # Sliding windows, real-time aggregations, session tracking
 │
 ├── 🗄️ feature_store/                    # Dual-store feature management
 │   ├── online_store.py                  # Redis: TTL, JSON serialization, connection pooling
 │   ├── offline_store.py                 # PostgreSQL: versioning, point-in-time joins, time-travel
-│   ├── sync_pipeline.py                # Bidirectional sync with 3 conflict resolution strategies
-│   └── feature_definitions.py          # Feast FeatureView / Entity / FeatureService definitions
+│   └── sync_pipeline.py                # Bidirectional sync with real DB queries + 3 conflict strategies
 │
 ├── 📊 monitoring/                       # Observability stack configuration
 │   ├── prometheus.yaml                  # Scrape configs: API, Redis, Kafka, Node exporters
-│   ├── alert_rules.yaml                 # 30+ alert rules across 8 groups (latency, errors, drift, SLOs)
+│   ├── alert_rules.yaml                 # 30+ alert rules across 8 groups
 │   ├── otel_config.yaml                 # OpenTelemetry Collector: OTLP, Jaeger, tail sampling
 │   ├── drift_detection.py              # Statistical drift: PSI, KL Divergence, KS Test + auto-retrain
-│   └── grafana_dashboard.json           # Grafana dashboard definition
+│   ├── grafana_dashboard.json           # 12-panel production Grafana dashboard
+│   ├── grafana-datasource.yml           # Auto-provisioned Prometheus datasource
+│   └── grafana-dashboard-provider.yml   # Auto-provisioned dashboard loader
 │
 ├── 🏗️ infrastructure/                   # Production deployment configs
-│   ├── docker/
-│   │   └── Dockerfile                   # Multi-stage build, non-root user, health checks, multi-arch
-│   └── kubernetes/
-│       ├── api-deployment.yaml          # Deployment + HPA (3–50 pods, custom metrics) + PDB + NetworkPolicy
-│       ├── kafka-cluster.yaml           # Strimzi: 3 brokers, 3 ZK, SASL/SCRAM, TLS, 6 topics
-│       ├── redis-cluster.yaml           # Redis Operator: 6 nodes (3M+3R), 12GB, LRU eviction
-│       └── training-job.yaml            # DDP Job: 4 GPU workers (V100/A100), S3 checkpoints
+│   ├── kubernetes/
+│   │   ├── api-deployment.yaml          # Deployment + HPA (3–50 pods) + PDB + NetworkPolicy
+│   │   ├── kafka-cluster.yaml           # Strimzi: 3 brokers, 3 ZK, SASL/SCRAM, TLS
+│   │   ├── redis-cluster.yaml           # Redis Operator: 6 nodes, 12GB, LRU eviction
+│   │   ├── training-job.yaml            # DDP Job: 4 GPU workers (V100/A100)
+│   │   └── ingress.yaml                 # NGINX Ingress with TLS + rate limiting
+│   └── helm/rec-engine/                 # Helm chart (8 templates)
+│       ├── Chart.yaml                   # Chart metadata (v1.0.0)
+│       ├── values.yaml                  # Default values (replicas, resources, HPA, env)
+│       └── templates/                   # deployment, service, hpa, ingress, configmap
+│
+├── 🧪 tests/                            # Comprehensive test suite
+│   ├── conftest.py                      # 8 shared fixtures (mocked Redis, PostgreSQL, FastAPI)
+│   ├── pytest.ini                       # Markers: unit, integration, slow
+│   ├── unit/
+│   │   ├── test_api_routes.py           # 12 API endpoint tests
+│   │   ├── test_model.py                # 8 Two-Tower model tests
+│   │   ├── test_feature_store.py        # 9 feature store tests
+│   │   ├── test_index.py                # 6 ANN index tests
+│   │   ├── test_streaming.py            # 5 streaming pipeline tests
+│   │   └── test_config.py               # 6 config tests
+│   └── integration/
+│       ├── test_api_integration.py       # API flow integration tests
+│       ├── test_feature_pipeline.py      # Feature sync integration tests
+│       └── test_streaming_pipeline.py    # Kafka pipeline integration tests
 │
 ├── 🧪 load_testing/                     # Performance & chaos testing
 │   ├── locustfile.py                    # 4 user types: recommend, batch, events, feature store
@@ -236,10 +257,34 @@ realtime-rec-engine-v2/
 │
 ├── 🔄 ci-cd/                            # Continuous integration & deployment
 │   ├── github-actions.yml               # 8-job pipeline: lint → test → build → scan → deploy
-│   ├── canary_deploy.yml                # Argo Rollouts + Istio: 10%→25%→50%→75%→100%
+│   ├── canary_deploy.yml                # Argo Rollouts + Istio canary deployments
 │   └── build_and_push.sh              # Docker multi-arch build & ECR push script
 │
-└── requirements.txt                     # 94 Python dependencies
+├── 🗃️ alembic/                          # Database migrations
+│   ├── env.py                           # Migration environment (reads DATABASE_URL)
+│   ├── script.py.mako                   # Migration template
+│   └── versions/
+│       └── 001_initial_schema.py        # Initial: features, interactions, model_versions tables
+│
+├── 🐳 Docker Compose
+│   ├── docker-compose.yml               # Full stack: Redis, PostgreSQL, Kafka, Prometheus, Grafana, Jaeger
+│   ├── docker-compose.test.yml          # Minimal stack for integration tests
+│   └── docker-compose.monitoring.yml    # Full observability: Prometheus, Grafana, Jaeger, OTel, exporters
+│
+├── ⚙️ Project Configuration
+│   ├── .env.example                     # All environment variables with descriptions
+│   ├── .gitignore                       # Python, ML, IDE, Docker, OS patterns
+│   ├── .pre-commit-config.yaml          # 6 hook repos: black, isort, flake8, mypy, bandit
+│   ├── config.yaml                      # Application config (all sections)
+│   ├── pyproject.toml                   # Project metadata + tool configs
+│   ├── alembic.ini                      # Alembic database migration config
+│   ├── pytest.ini                       # Test runner configuration
+│   ├── Makefile                         # 11 development workflow targets
+│   ├── requirements.txt                 # 94 Python dependencies
+│   ├── LICENSE                          # MIT License
+│   ├── CONTRIBUTING.md                  # Contributing guide
+│   └── README.md                        # This file
+└──
 ```
 
 ---
@@ -535,12 +580,28 @@ An **Apache Kafka** event streaming system with exactly-once semantics, Avro sch
 | GPU | NVIDIA V100/A100 *(training only)* |
 | Kubernetes | 1.24+ *(production only)* |
 
-### Local Development
+### Option A: Quick Start with Make
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/company/rec-engine.git
-cd rec-engine/realtime-rec-engine-v2
+git clone https://github.com/genius-0963/Real-time-recommendation-engine.git
+cd Real-time-recommendation-engine/realtime-rec-engine-v2
+
+# 2. Copy and configure environment variables
+cp .env.example .env
+# Edit .env with your settings (database, redis, kafka, etc.)
+
+# 3. Install dependencies + start services + run server
+make install
+make dev          # starts docker-compose + uvicorn with hot-reload
+```
+
+### Option B: Manual Setup
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/genius-0963/Real-time-recommendation-engine.git
+cd Real-time-recommendation-engine/realtime-rec-engine-v2
 
 # 2. Create and activate a virtual environment
 python -m venv venv
@@ -550,15 +611,33 @@ source venv/bin/activate          # macOS/Linux
 # 3. Install dependencies (94 packages)
 pip install -r requirements.txt
 
-# 4. Start backing services (Redis, PostgreSQL, Kafka)
+# 4. Copy environment config
+cp .env.example .env
+
+# 5. Start backing services (Redis, PostgreSQL, Kafka, etc.)
 docker-compose up -d
 
-# 5. Run database migrations
+# 6. Run database migrations
 alembic upgrade head
 
-# 6. Start the API server (with hot-reload)
+# 7. Start the API server (with hot-reload)
 uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+### Makefile Targets
+
+| Target | Description |
+|---|---|
+| `make install` | Create venv and install dependencies |
+| `make dev` | Start docker-compose + uvicorn with hot-reload |
+| `make test` | Run unit tests with coverage |
+| `make test-integration` | Run integration tests (starts test services) |
+| `make lint` | Run black, flake8, mypy checks |
+| `make format` | Auto-format code with black + isort |
+| `make build` | Build Docker image |
+| `make clean` | Remove caches and build artifacts |
+| `make load-test` | Run Locust load test |
+| `make chaos-test` | Run chaos engineering experiments |
 
 ### Verify Installation
 
@@ -857,35 +936,54 @@ The `AutomatedRetrainingTrigger` monitors all features and initiates retraining 
 
 ## 🧪 Testing
 
-### Test Suite
+### Test Suite Overview
+
+The project includes **46+ tests** across unit and integration suites:
+
+| Test File | Tests | Coverage |
+|---|---|---|
+| `tests/unit/test_api_routes.py` | 12 | API endpoints (health, recommend, events, features, model, index, metrics) |
+| `tests/unit/test_model.py` | 8 | Two-Tower model (forward pass, embeddings, loss, save/load) |
+| `tests/unit/test_feature_store.py` | 9 | Online store (set/get, batch, TTL, health, stats) |
+| `tests/unit/test_index.py` | 6 | FAISS index (build, search, save/load, IndexManager) |
+| `tests/unit/test_streaming.py` | 5 | Kafka consumer (deserializer, DLQ, metrics, handlers) |
+| `tests/unit/test_config.py` | 6 | Config defaults, env loading, dataclass validation |
+| `tests/integration/test_api_integration.py` | 3 | Full recommendation flow, event ingestion, health |
+| `tests/integration/test_feature_pipeline.py` | 3 | Feature sync between online/offline stores |
+| `tests/integration/test_streaming_pipeline.py` | 3 | Kafka produce→consume roundtrip |
+
+### Running Tests
 
 ```bash
+# ── Quick: Use Make ───────────────────────────────
+make test                  # Unit tests with coverage
+make test-integration      # Integration tests (auto-starts services)
+
 # ── Unit Tests ────────────────────────────────────
-pytest tests/unit/ -v --cov=app
+pytest tests/unit/ -v --cov=app --cov=training --cov=index \
+  --cov=streaming --cov=feature_store --cov-report=term-missing
 
 # Unit tests with HTML coverage report
 pytest tests/unit/ --cov=app --cov-report=html
 
-# ── Integration Tests (with services) ────────────
-docker-compose -f docker-compose.test.yml up -d   # Redis, PostgreSQL, Kafka
-pytest tests/integration/ -v --env=test
+# ── Integration Tests (requires services) ────────
+docker-compose -f docker-compose.test.yml up -d
+pytest tests/integration/ -v -m integration
+docker-compose -f docker-compose.test.yml down
 ```
 
 ### Load Testing
 
 ```bash
 # ── Locust (4 user types) ────────────────────────
-# Types: RecommendationUser, BatchRecommendationUser,
-#        EventIngestionUser, FeatureStoreUser
+make load-test
+# Or manually:
 locust -f load_testing/locustfile.py \
   --host http://localhost:8000 \
-  --users 1000 \
-  --spawn-rate 100 \
-  --run-time 300s
+  --users 1000 --spawn-rate 100 --run-time 300s
 
 # ── k6 (staged performance test) ─────────────────
 # Stages: 10 → 50 → 100 → 0 VUs over 6.5 minutes
-# Thresholds: P95 < 500ms, P99 < 1s, error rate < 1%
 k6 run load_testing/k6_script.js
 ```
 
@@ -894,10 +992,10 @@ k6 run load_testing/k6_script.js
 Built-in chaos engineering framework with **10 experiment types** and Prometheus-based impact assessment:
 
 ```bash
+make chaos-test
+# Or manually:
 python load_testing/chaos_testing.py \
-  --experiment <type> \
-  --duration 300s \
-  --namespace rec-engine-prod
+  --experiment <type> --duration 300s --namespace rec-engine-prod
 ```
 
 | Experiment | Description |
@@ -919,13 +1017,29 @@ python load_testing/chaos_testing.py \
 
 ## 🚢 Deployment
 
-### Docker
+### Docker Compose (Development)
+
+Three compose files for different environments:
+
+```bash
+# Full development stack (Redis, PostgreSQL, Kafka, Prometheus, Grafana, Jaeger)
+docker-compose up -d
+
+# Integration test stack (minimal: Redis, PostgreSQL, Kafka, Zookeeper)
+docker-compose -f docker-compose.test.yml up -d
+
+# Full monitoring stack (Prometheus, Grafana, Jaeger, OTel, exporters)
+docker-compose -f docker-compose.monitoring.yml up -d
+```
+
+### Docker (Production)
 
 Multi-stage Docker build with non-root user, health checks, and multi-architecture support (amd64 + arm64):
 
 ```bash
 # Build the image
-docker build -t rec-engine:latest -f infrastructure/docker/Dockerfile .
+make build
+# Or: docker build -t rec-engine:latest -f infrastructure/docker/Dockerfile .
 
 # Run locally
 docker run -p 8000:8000 \
@@ -937,8 +1051,12 @@ docker run -p 8000:8000 \
 ### Kubernetes
 
 ```bash
-# Deploy the full stack
+# Deploy with raw manifests
 kubectl apply -f infrastructure/kubernetes/
+
+# Or deploy with Helm
+helm install rec-engine infrastructure/helm/rec-engine/ \
+  --namespace rec-engine-prod --create-namespace
 
 # Verify deployment
 kubectl get pods -n rec-engine-prod
@@ -952,6 +1070,7 @@ kubectl port-forward service/rec-engine-api 8000:80 -n rec-engine-prod
 | **API Deployment** | 3 replicas, rolling update (maxSurge: 1, maxUnavailable: 0) |
 | **HPA** | 3–50 pods, CPU 70% + Memory 80% + custom QPS/latency metrics |
 | **PDB** | minAvailable: 2 (ensures availability during updates) |
+| **Ingress** | NGINX with TLS (cert-manager), rate limiting (1000 req/min) |
 | **NetworkPolicy** | Restricts traffic between services |
 | **Init Container** | Pre-loads model from S3 before serving |
 | **Resources** | Request: 500m CPU / 512Mi RAM — Limit: 2 CPU / 2Gi RAM |
@@ -959,6 +1078,7 @@ kubectl port-forward service/rec-engine-api 8000:80 -n rec-engine-prod
 | **Kafka Cluster** | Strimzi: 3 brokers + 3 ZooKeeper, SASL/SCRAM + TLS |
 | **Redis Cluster** | 6 nodes (3 masters + 3 replicas), 12GB maxmemory, LRU eviction |
 | **Training Job** | 4 parallel GPU workers (V100/A100), 24h deadline, 500GB data PVC |
+| **Helm Chart** | Templatized deployment, service, HPA, ingress, configmap |
 
 ### Canary Deployment (Argo Rollouts + Istio)
 
@@ -1047,10 +1167,18 @@ We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) f
 # 2. Create a feature branch
 git checkout -b feature/amazing-feature
 
-# 3. Make changes and commit (conventional commits)
+# 3. Set up pre-commit hooks (one-time)
+pip install pre-commit
+pre-commit install
+
+# 4. Make changes and commit (conventional commits)
 git commit -m "feat: add amazing feature"
 
-# 4. Push and open a PR
+# 5. Run checks before pushing
+make lint
+make test
+
+# 6. Push and open a PR
 git push origin feature/amazing-feature
 ```
 
@@ -1058,12 +1186,13 @@ git push origin feature/amazing-feature
 
 | Tool | Purpose | Command |
 |---|---|---|
-| `black` | Code formatting | `black .` |
-| `flake8` | PEP 8 linting | `flake8 .` |
-| `mypy` | Static type checking | `mypy .` |
-| `bandit` | Security analysis | `bandit -r .` |
-| `pytest` | Tests (all must pass) | `pytest --cov=app` |
-| `pre-commit` | Git hooks | `pre-commit run --all-files` |
+| `black` | Code formatting (line-length=100) | `make format` |
+| `isort` | Import sorting (black profile) | `make format` |
+| `flake8` | PEP 8 linting | `make lint` |
+| `mypy` | Static type checking | `make lint` |
+| `bandit` | Security analysis | `bandit -r . --skip=B101` |
+| `pytest` | Tests (all must pass) | `make test` |
+| `pre-commit` | Git hooks (auto on commit) | `pre-commit run --all-files` |
 
 ---
 

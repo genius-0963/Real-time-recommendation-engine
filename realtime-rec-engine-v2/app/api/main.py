@@ -17,15 +17,42 @@ from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, R
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
 import uvicorn
 
 from app.config import Config
+from app.security import (
+    AuthMiddleware,
+    get_security_config,
+    require_rec_read,
+    require_rec_write,
+    require_metrics_read,
+    require_experiments_read,
+    require_admin,
+    TokenClaims,
+)
+from app.api.validators import (
+    RecommendationRequest,
+    FeedbackRequest,
+    BatchRecommendationRequest,
+    BatchFeedbackRequest,
+    FeaturesRequest,
+    ExperimentAssignRequest,
+    RecommendationItem,
+    RecommendationResponse,
+    FeedbackResponse,
+    FeaturesResponse,
+    MetricsResponse,
+    ExperimentResponse,
+    ErrorResponse,
+    HealthResponse,
+    format_validation_error,
+)
 from app.services.recommendation_service import RecommendationService
 from app.services.feature_service import FeatureService
 from app.cache.redis_cache import RedisCache
 from app.monitoring.metrics_collector import MetricsCollector
-from app.monitoring.rate_limiter import RateLimiter
+from app.monitoring.rate_limiter import create_rate_limiter, check_rate_limit, MultiTierRateLimiter
+from app.monitoring.middleware import setup_middleware
 from app.experiments.ab_testing import ABTestManager
 
 logging.basicConfig(level=logging.INFO)
@@ -37,7 +64,7 @@ recommendation_service = None
 feature_service = None
 cache = None
 metrics = None
-rate_limiter = None
+rate_limiter: MultiTierRateLimiter = None
 ab_test_manager = None
 
 
@@ -57,8 +84,12 @@ async def lifespan(app: FastAPI):
             config.model, feature_service, cache
         )
         metrics = MetricsCollector(config.monitoring)
-        rate_limiter = RateLimiter(config.api)
         ab_test_manager = ABTestManager(config.experiments)
+        
+        # Initialize distributed rate limiter
+        if cache and cache.redis:
+            rate_limiter = create_rate_limiter(cache.redis)
+            app.state.rate_limiter = rate_limiter
         
         # Load models and indexes
         await recommendation_service.initialize()
@@ -88,120 +119,59 @@ app = FastAPI(
     version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
-    lifespan=lifespan
+    lifespan=lifespan,
+    # Response models for OpenAPI
+    responses={
+        400: {"model": ErrorResponse, "description": "Bad Request"},
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Forbidden"},
+        404: {"model": ErrorResponse, "description": "Not Found"},
+        413: {"model": ErrorResponse, "description": "Payload Too Large"},
+        422: {"model": ErrorResponse, "description": "Validation Error"},
+        429: {"model": ErrorResponse, "description": "Rate Limit Exceeded"},
+        500: {"model": ErrorResponse, "description": "Internal Server Error"},
+        503: {"model": ErrorResponse, "description": "Service Unavailable"},
+        504: {"model": ErrorResponse, "description": "Gateway Timeout"},
+    }
 )
 
-# Add middleware
+# Setup all middleware (security, size limits, timeout, circuit breaker, metrics)
+security_config = get_security_config()
+middleware_config = {
+    "hsts_max_age": security_config.hsts_max_age,
+    "csp_policy": security_config.csp_policy,
+    "max_request_size": config.api.max_request_size if hasattr(config.api, 'max_request_size') else 1_048_576,
+    "request_timeout": config.api.request_timeout,
+    "circuit_breaker_threshold": config.api.circuit_breaker_threshold,
+    "circuit_breaker_timeout": config.api.circuit_breaker_timeout,
+}
+setup_middleware(app, middleware_config, metrics)
+
+# Add security middleware (must be added before other middleware)
+AuthMiddleware(app, security_config)
+
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.api.cors_origins,
-    allow_credentials=True,
-    allow_methods=config.api.cors_methods,
-    allow_headers=config.api.cors_headers,
+    allow_credentials=security_config.cors_allow_credentials,
+    allow_methods=security_config.cors_methods,
+    allow_headers=security_config.cors_headers,
 )
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
-# Pydantic models
-class RecommendationRequest(BaseModel):
-    """Request model for recommendations."""
-    user_id: str = Field(..., description="Unique user identifier")
-    session_id: Optional[str] = Field(None, description="Session identifier")
-    num_recommendations: int = Field(10, ge=1, le=100, description="Number of recommendations")
-    candidate_items: Optional[List[str]] = Field(None, description="Specific candidate items to rank")
-    filters: Optional[Dict[str, Any]] = Field(None, description="Request filters")
-    context: Optional[Dict[str, Any]] = Field(None, description="Additional context")
-    ab_test_info: Optional[Dict[str, str]] = Field(None, description="A/B test information")
-    
-    @validator('num_recommendations')
-    def validate_num_recommendations(cls, v):
-        if v < 1 or v > 100:
-            raise ValueError('num_recommendations must be between 1 and 100')
-        return v
-
-
-class RecommendationItem(BaseModel):
-    """Single recommendation item."""
-    item_id: str = Field(..., description="Item identifier")
-    score: float = Field(..., description="Recommendation score")
-    rank: int = Field(..., description="Recommendation rank")
-    explanation: Optional[str] = Field(None, description="Explanation for recommendation")
-    metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata")
-
-
-class RecommendationResponse(BaseModel):
-    """Response model for recommendations."""
-    request_id: str = Field(..., description="Unique request identifier")
-    recommendations: List[RecommendationItem] = Field(..., description="List of recommendations")
-    user_id: str = Field(..., description="User identifier")
-    session_id: Optional[str] = Field(None, description="Session identifier")
-    metadata: Dict[str, Any] = Field(..., description="Response metadata")
-    timestamp: datetime = Field(..., description="Response timestamp")
-
-
-class FeedbackRequest(BaseModel):
-    """Request model for user feedback."""
-    user_id: str = Field(..., description="User identifier")
-    item_id: str = Field(..., description="Item identifier")
-    interaction_type: str = Field(..., description="Type of interaction")
-    rating: Optional[float] = Field(None, ge=1, le=5, description="User rating")
-    timestamp: Optional[datetime] = Field(None, description="Interaction timestamp")
-    metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata")
-
-
-class MetricsResponse(BaseModel):
-    """Response model for metrics."""
-    timestamp: datetime = Field(..., description="Metrics timestamp")
-    metrics: Dict[str, Any] = Field(..., description="Metrics data")
-
-
-# Dependency injection
-async def get_rate_limit_key(request: Request) -> str:
-    """Extract rate limit key from request."""
-    # Use IP address or user ID for rate limiting
-    user_id = request.headers.get("X-User-ID")
-    if user_id:
-        return f"user:{user_id}"
-    return f"ip:{request.client.host}"
-
-
-async def check_rate_limit(key: str = Depends(get_rate_limit_key)) -> None:
-    """Check rate limits."""
-    if not rate_limiter.is_allowed(key):
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded",
-            headers={"Retry-After": str(rate_limiter.get_retry_after(key))}
-        )
-
-
-# Middleware for request tracking
-@app.middleware("http")
-async def track_requests(request: Request, call_next):
-    """Track requests and collect metrics."""
-    start_time = time.time()
-    request_id = str(uuid.uuid4())
-    
-    # Add request ID to response headers
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    
-    # Record metrics
-    duration = time.time() - start_time
-    await metrics.record_request(
-        method=request.method,
-        endpoint=str(request.url.path),
-        status_code=response.status_code,
-        duration=duration,
-        request_id=request_id
-    )
-    
-    return response
+# Rate limit dependency
+async def rate_limit_dependency(request: Request, user: TokenClaims = Depends(require_rec_read)) -> None:
+    """Rate limit dependency that uses user claims for role-based limits."""
+    roles = user.roles if hasattr(user, 'roles') else []
+    user_id = user.sub if hasattr(user, 'sub') else None
+    await check_rate_limit(request, user_id=user_id, roles=roles)
 
 
 # API endpoints
-@app.get("/health", tags=["Health"])
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
     """Health check endpoint."""
     try:
@@ -229,14 +199,11 @@ async def health_check():
         
         status_code = 200 if services_healthy else 503
         
-        return JSONResponse(
-            status_code=status_code,
-            content={
-                "status": "healthy" if services_healthy else "unhealthy",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "services": service_status,
-                "version": "2.0.0"
-            }
+        return HealthResponse(
+            status="healthy" if services_healthy else "unhealthy",
+            timestamp=datetime.now(timezone.utc),
+            services=service_status,
+            version="2.0.0"
         )
         
     except Exception as e:
@@ -244,9 +211,13 @@ async def health_check():
         return JSONResponse(
             status_code=503,
             content={
-                "status": "unhealthy",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "error": str(e)
+                "error": {
+                    "code": 503,
+                    "message": "Health check failed",
+                    "type": "HealthCheckError",
+                    "details": str(e),
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
             }
         )
 
@@ -255,7 +226,8 @@ async def health_check():
 async def get_recommendations(
     request: RecommendationRequest,
     background_tasks: BackgroundTasks,
-    _: None = Depends(check_rate_limit)
+    user: TokenClaims = Depends(require_rec_read),
+    _: None = Depends(rate_limit_dependency),
 ):
     """Get personalized recommendations for a user."""
     request_id = str(uuid.uuid4())
@@ -351,13 +323,92 @@ async def get_recommendations(
         )
 
 
-@app.post("/feedback", tags=["Feedback"])
+@app.post("/recommend/batch", response_model=List[RecommendationResponse], tags=["Recommendations"])
+async def get_batch_recommendations(
+    request: BatchRecommendationRequest,
+    background_tasks: BackgroundTasks,
+    user: TokenClaims = Depends(require_rec_read),
+    _: None = Depends(rate_limit_dependency),
+):
+    """Get personalized recommendations for multiple users in batch."""
+    request_id = str(uuid.uuid4())
+    start_time = time.time()
+    
+    try:
+        logger.info(f"Processing batch recommendation request {request_id} with {len(request.requests)} requests")
+        
+        responses = []
+        for req in request.requests:
+            # A/B test routing per request
+            experiment_config = None
+            if req.ab_test_info:
+                experiment_config = await ab_test_manager.get_experiment_config(
+                    req.user_id, 
+                    req.ab_test_info.get("experiment_id")
+                )
+            
+            recommendations = await recommendation_service.get_recommendations(
+                user_id=req.user_id,
+                session_id=req.session_id,
+                num_recommendations=req.num_recommendations,
+                candidate_items=req.candidate_items,
+                filters=req.filters,
+                context=req.context,
+                experiment_config=experiment_config
+            )
+            
+            response_items = []
+            for i, rec in enumerate(recommendations):
+                response_items.append(RecommendationItem(
+                    item_id=rec["item_id"],
+                    score=rec["score"],
+                    rank=i + 1,
+                    explanation=rec.get("explanation"),
+                    metadata=rec.get("metadata", {})
+                ))
+            
+            metadata = {
+                "model_version": recommendations[0].get("model_version", "unknown") if recommendations else "unknown",
+                "latency_ms": (time.time() - start_time) * 1000,
+                "cache_hit": recommendations[0].get("cache_hit", False) if recommendations else False,
+                "candidate_pool_size": len(req.candidate_items) if req.candidate_items else "auto",
+                "experiment_info": experiment_config
+            }
+            
+            responses.append(RecommendationResponse(
+                request_id=f"{request_id}_{req.user_id}",
+                recommendations=response_items,
+                user_id=req.user_id,
+                session_id=req.session_id,
+                metadata=metadata,
+                timestamp=datetime.now(timezone.utc)
+            ))
+        
+        logger.info(f"Generated batch recommendations for {len(responses)} users in {(time.time() - start_time)*1000:.2f}ms")
+        return responses
+        
+    except Exception as e:
+        logger.error(f"Failed to generate batch recommendations: {e}")
+        await metrics.record_error(
+            endpoint="/recommend/batch",
+            error_type=str(type(e).__name__),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate batch recommendations: {str(e)}"
+        )
+
+
+@app.post("/feedback", response_model=FeedbackResponse, tags=["Feedback"])
 async def record_feedback(
     feedback: FeedbackRequest,
     background_tasks: BackgroundTasks,
-    _: None = Depends(check_rate_limit)
+    user: TokenClaims = Depends(require_rec_write),
+    _: None = Depends(rate_limit_dependency),
 ):
     """Record user feedback for recommendations."""
+    request_id = str(uuid.uuid4())
+    
     try:
         logger.info(f"Recording feedback for user {feedback.user_id}, item {feedback.item_id}")
         
@@ -389,7 +440,9 @@ async def record_feedback(
             feedback.metadata
         )
         
-        return {"status": "success", "message": "Feedback recorded successfully"}
+        return FeedbackResponse(
+            request_id=request_id
+        )
         
     except Exception as e:
         logger.error(f"Failed to record feedback: {e}")
@@ -406,27 +459,91 @@ async def record_feedback(
         )
 
 
-@app.get("/user/{user_id}/features", tags=["Features"])
+@app.post("/feedback/batch", response_model=List[FeedbackResponse], tags=["Feedback"])
+async def record_batch_feedback(
+    request: BatchFeedbackRequest,
+    background_tasks: BackgroundTasks,
+    user: TokenClaims = Depends(require_rec_write),
+    _: None = Depends(rate_limit_dependency),
+):
+    """Record feedback for multiple users in batch."""
+    request_id = str(uuid.uuid4())
+    
+    try:
+        logger.info(f"Recording batch feedback for {len(request.feedback)} events")
+        
+        responses = []
+        for fb in request.feedback:
+            await recommendation_service.record_feedback(
+                user_id=fb.user_id,
+                item_id=fb.item_id,
+                interaction_type=fb.interaction_type,
+                rating=fb.rating,
+                timestamp=fb.timestamp or datetime.now(timezone.utc),
+                metadata=fb.metadata
+            )
+            
+            await metrics.record_feedback(
+                user_id=fb.user_id,
+                item_id=fb.item_id,
+                interaction_type=fb.interaction_type,
+                rating=fb.rating
+            )
+            
+            background_tasks.add_task(
+                recommendation_service.process_feedback,
+                fb.user_id,
+                fb.item_id,
+                fb.interaction_type,
+                fb.rating,
+                fb.metadata
+            )
+            
+            responses.append(FeedbackResponse(
+                request_id=f"{request_id}_{fb.user_id}"
+            ))
+        
+        return responses
+        
+    except Exception as e:
+        logger.error(f"Failed to record batch feedback: {e}")
+        await metrics.record_error(
+            endpoint="/feedback/batch",
+            error_type=str(type(e).__name__),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to record batch feedback: {str(e)}"
+        )
+
+
+@app.get("/user/{user_id}/features", response_model=FeaturesResponse, tags=["Features"])
 async def get_user_features(
     user_id: str,
     feature_names: Optional[str] = None,
-    _: None = Depends(check_rate_limit)
+    user: TokenClaims = Depends(require_rec_read),
+    _: None = Depends(rate_limit_dependency),
 ):
     """Get features for a specific user."""
     try:
-        features = []
+        validated_features = None
         if feature_names:
             feature_list = feature_names.split(",")
-            features = await feature_service.get_user_features(user_id, feature_list)
+            # Validate feature names
+            from app.api.validators import validate_feature_names
+            validated_features = validate_feature_names(feature_list)
+            features = await feature_service.get_user_features(user_id, validated_features)
         else:
             features = await feature_service.get_all_user_features(user_id)
         
-        return {
-            "user_id": user_id,
-            "features": features,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
+        return FeaturesResponse(
+            user_id=user_id,
+            features=features,
+            timestamp=datetime.now(timezone.utc)
+        )
         
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.error(f"Failed to get user features: {e}")
         raise HTTPException(
@@ -435,27 +552,32 @@ async def get_user_features(
         )
 
 
-@app.get("/item/{item_id}/features", tags=["Features"])
+@app.get("/item/{item_id}/features", response_model=FeaturesResponse, tags=["Features"])
 async def get_item_features(
     item_id: str,
     feature_names: Optional[str] = None,
-    _: None = Depends(check_rate_limit)
+    user: TokenClaims = Depends(require_rec_read),
+    _: None = Depends(rate_limit_dependency),
 ):
     """Get features for a specific item."""
     try:
-        features = []
+        validated_features = None
         if feature_names:
             feature_list = feature_names.split(",")
-            features = await feature_service.get_item_features(item_id, feature_list)
+            from app.api.validators import validate_feature_names
+            validated_features = validate_feature_names(feature_list)
+            features = await feature_service.get_item_features(item_id, validated_features)
         else:
             features = await feature_service.get_all_item_features(item_id)
         
-        return {
-            "item_id": item_id,
-            "features": features,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
+        return FeaturesResponse(
+            user_id=item_id,  # Using user_id field for item_id in response model
+            features=features,
+            timestamp=datetime.now(timezone.utc)
+        )
         
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.error(f"Failed to get item features: {e}")
         raise HTTPException(
@@ -465,7 +587,10 @@ async def get_item_features(
 
 
 @app.get("/metrics", response_model=MetricsResponse, tags=["Monitoring"])
-async def get_metrics():
+async def get_metrics(
+    user: TokenClaims = Depends(require_metrics_read),
+    _: None = Depends(rate_limit_dependency),
+):
     """Get system metrics."""
     try:
         metrics_data = await metrics.get_current_metrics()
@@ -483,16 +608,24 @@ async def get_metrics():
         )
 
 
-@app.get("/experiments", tags=["Experiments"])
-async def get_experiments():
+@app.get("/experiments", response_model=List[ExperimentResponse], tags=["Experiments"])
+async def get_experiments(
+    user: TokenClaims = Depends(require_experiments_read),
+    _: None = Depends(rate_limit_dependency),
+):
     """Get active A/B experiments."""
     try:
         experiments = await ab_test_manager.get_active_experiments()
         
-        return {
-            "experiments": experiments,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
+        return [
+            ExperimentResponse(
+                experiment_id=exp["experiment_id"],
+                user_id="",  # Not user-specific
+                assignment=exp,
+                timestamp=datetime.now(timezone.utc)
+            )
+            for exp in experiments
+        ]
         
     except Exception as e:
         logger.error(f"Failed to get experiments: {e}")
@@ -502,25 +635,26 @@ async def get_experiments():
         )
 
 
-@app.post("/experiments/{experiment_id}/assign", tags=["Experiments"])
+@app.post("/experiments/{experiment_id}/assign", response_model=ExperimentResponse, tags=["Experiments"])
 async def assign_experiment(
     experiment_id: str,
-    user_id: str,
-    _: None = Depends(check_rate_limit)
+    request: ExperimentAssignRequest,
+    user: TokenClaims = Depends(require_experiments_read),
+    _: None = Depends(rate_limit_dependency),
 ):
     """Assign user to an A/B test experiment."""
     try:
         assignment = await ab_test_manager.assign_user(
             experiment_id=experiment_id,
-            user_id=user_id
+            user_id=request.user_id
         )
         
-        return {
-            "experiment_id": experiment_id,
-            "user_id": user_id,
-            "assignment": assignment,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
+        return ExperimentResponse(
+            experiment_id=experiment_id,
+            user_id=request.user_id,
+            assignment=assignment,
+            timestamp=datetime.now(timezone.utc)
+        )
         
     except Exception as e:
         logger.error(f"Failed to assign experiment: {e}")
@@ -533,7 +667,9 @@ async def assign_experiment(
 # Error handlers
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """Handle HTTP exceptions."""
+    """Handle HTTP exceptions with standardized error format."""
+    request_id = getattr(request.state, "request_id", "unknown")
+    
     await metrics.record_error(
         endpoint=str(request.url.path),
         error_type="HTTPException",
@@ -544,18 +680,22 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         status_code=exc.status_code,
         content={
             "error": {
-                "type": "HTTPException",
+                "code": exc.status_code,
                 "message": exc.detail,
-                "status_code": exc.status_code,
+                "type": "HTTPException",
+                "request_id": request_id,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
-        }
+        },
+        headers=getattr(request.state, "rate_limit_headers", {})
     )
 
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    """Handle general exceptions."""
+    """Handle general exceptions with standardized error format."""
+    request_id = getattr(request.state, "request_id", "unknown")
+    
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
     
     await metrics.record_error(
@@ -567,8 +707,31 @@ async def general_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={
             "error": {
-                "type": type(exc).__name__,
+                "code": 500,
                 "message": "Internal server error",
+                "type": type(exc).__name__,
+                "request_id": request_id,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        },
+        headers=getattr(request.state, "rate_limit_headers", {})
+    )
+
+
+# Validation error handler
+@app.exception_handler(ValueError)
+async def validation_exception_handler(request: Request, exc: ValueError):
+    """Handle validation errors."""
+    request_id = getattr(request.state, "request_id", "unknown")
+    
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code": 422,
+                "message": str(exc),
+                "type": "ValidationError",
+                "request_id": request_id,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
         }

@@ -1,0 +1,373 @@
+version: "3.9"
+
+# Production docker-compose with TLS enabled
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+# Requires: certs/ directory with CA, server, and client certificates
+
+services:
+  # ─── Data Stores ────────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: rec-engine-redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+        --maxmemory 2gb
+        --maxmemory-policy allkeys-lru
+        --tls-port 6380
+        --port 0
+        --tls-cert-file /certs/redis-server.crt
+        --tls-key-file /certs/redis-server.key
+        --tls-ca-cert-file /certs/ca.crt
+        --tls-auth-clients yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "--tls", "--cert", "/certs/redis-client.crt", "--key", "/certs/redis-client.key", "--cacert", "/certs/ca.crt", "-p", "6380", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_data:/data
+      - ./certs:/certs:ro
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: rec-engine-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: rec_engine
+      POSTGRES_USER: rec_user
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_SSL: "on"
+      POSTGRES_SSL_CERT_FILE: /certs/postgres-server.crt
+      POSTGRES_SSL_KEY_FILE: /certs/postgres-server.key
+      POSTGRES_SSL_CA_FILE: /certs/ca.crt
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rec_user -d rec_engine -h localhost -p 5432"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./certs:/certs:ro
+    secrets:
+      - postgres_password
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  # ─── Kafka Ecosystem ───────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: rec-engine-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SECURE_CLIENT_PORT: 2182
+      ZOOKEEPER_SSL_KEYSTORE_LOCATION: /certs/zookeeper-keystore.jks
+      ZOOKEEPER_SSL_KEYSTORE_PASSWORD_FILE: /run/secrets/zookeeper_keystore_password
+      ZOOKEEPER_SSL_TRUSTSTORE_LOCATION: /certs/zookeeper-truststore.jks
+      ZOOKEEPER_SSL_TRUSTSTORE_PASSWORD_FILE: /run/secrets/zookeeper_truststore_password
+    volumes:
+      - ./certs:/certs:ro
+    secrets:
+      - zookeeper_keystore_password
+      - zookeeper_truststore_password
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: rec-engine-kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ZOOKEEPER_SSL_CLIENT_ENABLE: "true"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: SSL:SSL,SASL_SSL:SASL_SSL
+      KAFKA_ADVERTISED_LISTENERS: SSL://kafka:29093,SASL_SSL://kafka:29094
+      KAFKA_LISTENERS: SSL://0.0.0.0:29093,SASL_SSL://0.0.0.0:29094
+      KAFKA_SSL_KEYSTORE_LOCATION: /certs/kafka-keystore.jks
+      KAFKA_SSL_KEYSTORE_PASSWORD_FILE: /run/secrets/kafka_keystore_password
+      KAFKA_SSL_KEY_PASSWORD_FILE: /run/secrets/kafka_key_password
+      KAFKA_SSL_TRUSTSTORE_LOCATION: /certs/kafka-truststore.jks
+      KAFKA_SSL_TRUSTSTORE_PASSWORD_FILE: /run/secrets/kafka_truststore_password
+      KAFKA_SSL_CLIENT_AUTH: required
+      KAFKA_SASL_MECHANISM: SCRAM-SHA-512
+      KAFKA_SASL_ENABLED_MECHANISMS: SCRAM-SHA-512
+      KAFKA_SASL_JAAS_CONFIG: |
+        org.apache.kafka.common.security.scram.ScramLoginModule required
+        username="${KAFKA_USER}"
+        password="${KAFKA_PASSWORD}";
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_USER: kafka-user
+      KAFKA_PASSWORD_FILE: /run/secrets/kafka_password
+    volumes:
+      - ./certs:/certs:ro
+    secrets:
+      - kafka_keystore_password
+      - kafka_key_password
+      - kafka_truststore_password
+      - kafka_password
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: rec-engine-schema-registry
+    ports:
+      - "8081:8081"
+      - "8082:8082"
+    depends_on:
+      - kafka
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: SASL_SSL://kafka:29094
+      SCHEMA_REGISTRY_KAFKASTORE_SECURITY_PROTOCOL: SASL_SSL
+      SCHEMA_REGISTRY_KAFKASTORE_SASL_MECHANISM: SCRAM-SHA-512
+      SCHEMA_REGISTRY_KAFKASTORE_SASL_JAAS_CONFIG: |
+        org.apache.kafka.common.security.scram.ScramLoginModule required
+        username="schema-registry"
+        password="${SCHEMA_REGISTRY_PASSWORD}";
+      SCHEMA_REGISTRY_LISTENERS: https://0.0.0.0:8082
+      SCHEMA_REGISTRY_SSL_KEYSTORE_LOCATION: /certs/schema-registry-keystore.jks
+      SCHEMA_REGISTRY_SSL_KEYSTORE_PASSWORD_FILE: /run/secrets/sr_keystore_password
+      SCHEMA_REGISTRY_SSL_KEY_PASSWORD_FILE: /run/secrets/sr_key_password
+      SCHEMA_REGISTRY_SSL_TRUSTSTORE_LOCATION: /certs/schema-registry-truststore.jks
+      SCHEMA_REGISTRY_SSL_TRUSTSTORE_PASSWORD_FILE: /run/secrets/sr_truststore_password
+      SCHEMA_REGISTRY_SSL_CLIENT_AUTH: true
+    volumes:
+      - ./certs:/certs:ro
+    secrets:
+      - sr_keystore_password
+      - sr_key_password
+      - sr_truststore_password
+      - schema_registry_password
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+  # ─── Application ────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rec-engine-api
+    ports:
+      - "8000:8000"
+      - "8443:8443"
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - SECURITY_SECRET_BACKEND=env
+      - VAULT_ADDR=http://vault:8200
+      - OIDC_JWKS_URL=https://auth.example.com/.well-known/jwks.json
+      - OIDC_ISSUER=https://auth.example.com
+      - OIDC_AUDIENCE=rec-engine-api
+      - SECURITY_CORS_ORIGINS=https://app.example.com,https://dashboard.example.com
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29094
+      - KAFKA_SECURITY_PROTOCOL=SASL_SSL
+      - KAFKA_SASL_MECHANISM=SCRAM-SHA-512
+      - KAFKA_SASL_USERNAME=api-user
+      - KAFKA_SASL_PASSWORD_FILE=/run/secrets/kafka_api_password
+      - KAFKA_SSL_CAFILE=/certs/ca.crt
+      - KAFKA_SSL_CERTFILE=/certs/kafka-client.crt
+      - KAFKA_SSL_KEYFILE=/certs/kafka-client.key
+      - REDIS_HOST=redis
+      - REDIS_PORT=6380
+      - REDIS_PASSWORD_FILE=/run/secrets/redis_password
+      - REDIS_SSL_CERTFILE=/certs/redis-client.crt
+      - REDIS_SSL_KEYFILE=/certs/redis-client.key
+      - REDIS_SSL_CAFILE=/certs/ca.crt
+      - DATABASE_HOST=postgres
+      - DATABASE_PORT=5432
+      - DATABASE_USER=rec_user
+      - DATABASE_PASSWORD_FILE=/run/secrets/postgres_password
+      - DATABASE_SSL_MODE=verify-full
+      - DATABASE_SSL_CERT=/certs/postgres-client.crt
+      - DATABASE_SSL_KEY=/certs/postgres-client.key
+      - DATABASE_SSL_ROOT_CERT=/certs/ca.crt
+      - API_SSL_CERTFILE=/certs/api-server.crt
+      - API_SSL_KEYFILE=/certs/api-server.key
+    volumes:
+      - ./certs:/certs:ro
+    secrets:
+      - kafka_api_password
+      - redis_password
+      - postgres_password
+    depends_on:
+      - redis
+      - postgres
+      - kafka
+      - schema-registry
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2"
+        reservations:
+          memory: 1G
+          cpus: "1"
+
+  # ─── Observability ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: rec-engine-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert_rules.yaml:/etc/prometheus/alert_rules.yml:ro
+      - ./certs:/certs:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+      - "--web.config.file=/etc/prometheus/web.yml"
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: rec-engine-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD_FILE: /run/secrets/grafana_admin_password
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_PROTOCOL: https
+      GF_SERVER_CERT_FILE: /certs/grafana-server.crt
+      GF_SERVER_CERT_KEY: /certs/grafana-server.key
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./certs:/certs:ro
+    secrets:
+      - grafana_admin_password
+    depends_on:
+      - prometheus
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.50
+    container_name: rec-engine-jaeger
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+  # ─── Secrets Management ───────────────────────────────────────
+  vault:
+    image: hashicorp/vault:1.15
+    container_name: rec-engine-vault
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID_FILE: /run/secrets/vault_root_token
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_TLS_CERT_FILE: /certs/vault-server.crt
+      VAULT_TLS_KEY_FILE: /certs/vault-server.key
+    volumes:
+      - ./certs:/certs:ro
+    secrets:
+      - vault_root_token
+    cap_add:
+      - IPC_LOCK
+    networks:
+      - rec-engine-network
+    restart: unless-stopped
+
+# ─── Secrets ────────────────────────────────────────────────────
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+  zookeeper_keystore_password:
+    file: ./secrets/zookeeper_keystore_password.txt
+  zookeeper_truststore_password:
+    file: ./secrets/zookeeper_truststore_password.txt
+  kafka_keystore_password:
+    file: ./secrets/kafka_keystore_password.txt
+  kafka_key_password:
+    file: ./secrets/kafka_key_password.txt
+  kafka_truststore_password:
+    file: ./secrets/kafka_truststore_password.txt
+  kafka_password:
+    file: ./secrets/kafka_password.txt
+  kafka_api_password:
+    file: ./secrets/kafka_api_password.txt
+  sr_keystore_password:
+    file: ./secrets/sr_keystore_password.txt
+  sr_key_password:
+    file: ./secrets/sr_key_password.txt
+  sr_truststore_password:
+    file: ./secrets/sr_truststore_password.txt
+  schema_registry_password:
+    file: ./secrets/schema_registry_password.txt
+  redis_password:
+    file: ./secrets/redis_password.txt
+  grafana_admin_password:
+    file: ./secrets/grafana_admin_password.txt
+  vault_root_token:
+    file: ./secrets/vault_root_token.txt
+
+# ─── Volumes ────────────────────────────────────────────────────
+volumes:
+  redis_data:
+    driver: local
+  postgres_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+# ─── Networks ──────────────────────────────────────────────────
+networks:
+  rec-engine-network:
+    driver: bridge
+    name: rec-engine-network
+    internal: false
+    enable_ipv6: false

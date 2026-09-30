@@ -1,0 +1,152 @@
+# Security Configuration Template
+# Copy this file to security.yaml and fill in the values
+# NEVER commit security.yaml with real secrets to version control!
+# Use Vault/AWS Secrets Manager for production deployments.
+
+# Secret Backend Configuration
+# Options: vault, aws_secrets_manager, env
+secret_backend: "env"
+
+# HashiCorp Vault Configuration
+vault:
+  url: "https://vault.example.com:8200"
+  # Authentication methods:
+  # 1. Token auth (dev only):
+  # token: "s.your-vault-token"
+  # 2. AppRole auth (production):
+  auth_method: "approle"
+  role_id: "your-role-id"
+  secret_id: "your-secret-id"
+  # 3. Kubernetes auth:
+  # auth_method: "kubernetes"
+  # role: "rec-engine"
+  mount_point: "secret"
+  kv_version: 2
+  namespace: ""
+  timeout: 10
+  verify_ssl: true
+
+# AWS Secrets Manager Configuration
+aws_secrets_manager:
+  region: "us-east-1"
+  # Uses IAM role or environment credentials
+  # access_key_id: ""
+  # secret_access_key: ""
+  endpoint_url: ""
+  cache_ttl_seconds: 300
+
+# JWT/OIDC Configuration
+jwks_url: "https://auth.example.com/.well-known/jwks.json"
+issuer: "https://auth.example.com"
+audience: "rec-engine-api"
+algorithms: ["RS256"]
+token_cache_ttl_seconds: 300
+
+# RBAC Configuration
+admin_roles:
+  - "rec-engine-admin"
+  - "platform-admin"
+user_roles:
+  - "rec-engine-user"
+  - "data-scientist"
+
+# Required scopes per endpoint pattern
+required_scopes:
+  "/recommend": ["rec:read"]
+  "/feedback": ["rec:write"]
+  "/user/*/features": ["rec:read"]
+  "/item/*/features": ["rec:read"]
+  "/metrics": ["metrics:read"]
+  "/experiments": ["experiments:read"]
+  "/experiments/*/assign": ["experiments:write"]
+  "/admin/*": ["rec:admin"]
+  "/index/*": ["rec:admin"]
+
+# TLS Configuration per Service
+kafka_tls:
+  enabled: true
+  cert_file: "/etc/ssl/certs/kafka-client.crt"
+  key_file: "/etc/ssl/private/kafka-client.key"
+  ca_file: "/etc/ssl/certs/ca.crt"
+  verify_hostname: true
+  min_version: "TLSv1.3"
+
+redis_tls:
+  enabled: true
+  cert_file: "/etc/ssl/certs/redis-client.crt"
+  key_file: "/etc/ssl/private/redis-client.key"
+  ca_file: "/etc/ssl/certs/ca.crt"
+  verify_hostname: true
+  min_version: "TLSv1.3"
+
+postgres_tls:
+  enabled: true
+  cert_file: "/etc/ssl/certs/postgres-client.crt"
+  key_file: "/etc/ssl/private/postgres-client.key"
+  ca_file: "/etc/ssl/certs/ca.crt"
+  verify_hostname: true
+  min_version: "TLSv1.3"
+
+http_tls:
+  enabled: true
+  cert_file: "/etc/ssl/certs/api-server.crt"
+  key_file: "/etc/ssl/private/api-server.key"
+  ca_file: "/etc/ssl/certs/ca.crt"
+  verify_hostname: true
+  min_version: "TLSv1.3"
+
+# CORS Configuration (explicit domains only, no wildcards in production)
+cors_origins:
+  - "https://app.example.com"
+  - "https://dashboard.example.com"
+  - "https://admin.example.com"
+cors_methods:
+  - "GET"
+  - "POST"
+  - "OPTIONS"
+cors_headers:
+  - "Authorization"
+  - "Content-Type"
+  - "X-Request-ID"
+cors_allow_credentials: true
+
+# Security Headers
+hsts_max_age: 31536000
+csp_policy: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
+
+# Secret Paths (for Vault/AWS Secrets Manager)
+# These are the paths/names where secrets are stored
+secret_paths:
+  kafka: "rec-engine/kafka"
+  redis: "rec-engine/redis"
+  database: "rec-engine/database"
+  api: "rec-engine/api"
+  jwt: "rec-engine/jwt"
+
+# Expected secret structure for each path:
+#
+# kafka:
+#   username: "kafka-user"
+#   password: "kafka-password"
+#   ca_file: "/path/to/ca.crt"
+#   cert_file: "/path/to/client.crt"
+#   key_file: "/path/to/client.key"
+#
+# redis:
+#   password: "redis-password"
+#   ca_file: "/path/to/ca.crt"
+#   cert_file: "/path/to/client.crt"
+#   key_file: "/path/to/client.key"
+#
+# database:
+#   password: "database-password"
+#   ca_file: "/path/to/ca.crt"
+#   cert_file: "/path/to/client.crt"
+#   key_file: "/path/to/client.key"
+#
+# api:
+#   cert_file: "/path/to/server.crt"
+#   key_file: "/path/to/server.key"
+#
+# jwt:
+#   secret_key: "your-hs256-secret"  # Only used if not using RS256/JWKS

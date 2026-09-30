@@ -1,14 +1,21 @@
 """
 Configuration management for the real-time recommendation engine.
 Supports environment-specific configs and feature flags.
+All secrets are loaded from Vault/AWS Secrets Manager via security module.
 """
 
 import os
+import re
+import logging
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from pathlib import Path
 import yaml
 from omegaconf import OmegaConf
+
+from app.security.config import get_security_config, get_secret, SecretClient, SecretBackend
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -33,11 +40,17 @@ class KafkaConfig:
     # Schema registry
     schema_registry_url: str = "http://localhost:8081"
     
-    # Security
-    security_protocol: str = "PLAINTEXT"
-    sasl_mechanism: Optional[str] = None
+    # Security (loaded from secrets)
+    security_protocol: str = "SASL_SSL"
+    sasl_mechanism: str = "SCRAM-SHA-512"
     sasl_username: Optional[str] = None
     sasl_password: Optional[str] = None
+    
+    # TLS
+    ssl_cafile: Optional[str] = None
+    ssl_certfile: Optional[str] = None
+    ssl_keyfile: Optional[str] = None
+    ssl_check_hostname: bool = True
 
 
 @dataclass
@@ -57,6 +70,13 @@ class RedisConfig:
     cluster_enabled: bool = False
     cluster_nodes: List[Dict[str, str]] = field(default_factory=list)
     
+    # TLS configuration
+    ssl_enabled: bool = True
+    ssl_cafile: Optional[str] = None
+    ssl_certfile: Optional[str] = None
+    ssl_keyfile: Optional[str] = None
+    ssl_check_hostname: bool = True
+    
     # TTL configurations (seconds)
     user_features_ttl: int = 3600  # 1 hour
     item_features_ttl: int = 7200  # 2 hours
@@ -71,7 +91,7 @@ class DatabaseConfig:
     port: int = 5432
     database: str = "rec_engine"
     username: str = "postgres"
-    password: str = "postgres"
+    password: Optional[str] = None
     pool_size: int = 20
     max_overflow: int = 30
     pool_timeout: int = 30
@@ -81,8 +101,8 @@ class DatabaseConfig:
     connect_timeout: int = 10
     command_timeout: int = 30
     
-    # SSL settings
-    ssl_mode: str = "prefer"
+    # SSL settings (require SSL in production)
+    ssl_mode: str = "require"
     ssl_cert: Optional[str] = None
     ssl_key: Optional[str] = None
     ssl_root_cert: Optional[str] = None
@@ -178,19 +198,27 @@ class APIConfig:
     read_timeout: int = 60
     write_timeout: int = 60
     
+    # Request size limits
+    max_request_size: int = 1_048_576  # 1MB default
+    
     # Circuit breaker
     circuit_breaker_threshold: int = 5
     circuit_breaker_timeout: int = 60
     
-    # Authentication
-    jwt_secret_key: str = "your-secret-key"
-    jwt_algorithm: str = "HS256"
+    # Authentication (loaded from secrets)
+    jwt_algorithm: str = "RS256"
     jwt_expiration: int = 3600  # seconds
     
-    # CORS
-    cors_origins: List[str] = field(default_factory=lambda: ["*"])
-    cors_methods: List[str] = field(default_factory=lambda: ["GET", "POST"])
-    cors_headers: List[str] = field(default_factory=lambda: ["*"])
+    # CORS (must be explicitly configured)
+    cors_origins: List[str] = field(default_factory=list)
+    cors_methods: List[str] = field(default_factory=lambda: ["GET", "POST", "OPTIONS"])
+    cors_headers: List[str] = field(default_factory=lambda: ["Authorization", "Content-Type"])
+    cors_allow_credentials: bool = True
+    
+    # TLS
+    ssl_enabled: bool = True
+    ssl_certfile: Optional[str] = None
+    ssl_keyfile: Optional[str] = None
 
 
 @dataclass
@@ -305,8 +333,53 @@ class Config:
     
     @classmethod
     def from_env(cls) -> "Config":
-        """Load configuration from environment variables."""
+        """Load configuration from environment variables and secrets."""
         config = cls()
+        security_config = get_security_config()
+        secret_client = SecretClient(security_config) if security_config.secret_backend != SecretBackend.ENV else None
+        
+        # Load Kafka secrets
+        try:
+            kafka_secrets = get_secret("kafka") if secret_client else {}
+            if kafka_secrets:
+                config.kafka.sasl_username = kafka_secrets.get("username")
+                config.kafka.sasl_password = kafka_secrets.get("password")
+                config.kafka.ssl_cafile = kafka_secrets.get("ca_file")
+                config.kafka.ssl_certfile = kafka_secrets.get("cert_file")
+                config.kafka.ssl_keyfile = kafka_secrets.get("key_file")
+        except Exception as e:
+            logger.warning(f"Failed to load Kafka secrets: {e}")
+        
+        # Load Redis secrets
+        try:
+            redis_secrets = get_secret("redis") if secret_client else {}
+            if redis_secrets:
+                config.redis.password = redis_secrets.get("password")
+                config.redis.ssl_cafile = redis_secrets.get("ca_file")
+                config.redis.ssl_certfile = redis_secrets.get("cert_file")
+                config.redis.ssl_keyfile = redis_secrets.get("key_file")
+        except Exception as e:
+            logger.warning(f"Failed to load Redis secrets: {e}")
+        
+        # Load Database secrets
+        try:
+            db_secrets = get_secret("database") if secret_client else {}
+            if db_secrets:
+                config.database.password = db_secrets.get("password")
+                config.database.ssl_cert = db_secrets.get("cert_file")
+                config.database.ssl_key = db_secrets.get("key_file")
+                config.database.ssl_root_cert = db_secrets.get("ca_file")
+        except Exception as e:
+            logger.warning(f"Failed to load Database secrets: {e}")
+        
+        # Load API secrets
+        try:
+            api_secrets = get_secret("api") if secret_client else {}
+            if api_secrets:
+                config.api.ssl_certfile = api_secrets.get("cert_file")
+                config.api.ssl_keyfile = api_secrets.get("key_file")
+        except Exception as e:
+            logger.warning(f"Failed to load API secrets: {e}")
         
         # Override with environment variables
         if os.getenv("KAFKA_BOOTSTRAP_SERVERS"):
@@ -319,12 +392,14 @@ class Config:
             config.redis.port = int(os.getenv("REDIS_PORT"))
         
         if os.getenv("DATABASE_URL"):
-            # Parse database URL
-            import re
             match = re.match(r"postgresql://([^:]+):([^@]+)@([^:]+):(\d+)/(.+)", os.getenv("DATABASE_URL"))
             if match:
                 config.database.username, config.database.password, config.database.host, config.database.port, config.database.database = match.groups()
                 config.database.port = int(config.database.port)
+        
+        # Apply security config CORS
+        if security_config.cors_origins:
+            config.api.cors_origins = security_config.cors_origins
         
         return config
     

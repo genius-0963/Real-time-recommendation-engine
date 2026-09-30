@@ -1,0 +1,311 @@
+# Production values for rec-engine with TLS and security hardening
+# Usage: helm install rec-engine ./infrastructure/helm/rec-engine -f values-prod.yaml
+
+replicaCount: 3
+
+image:
+  repository: rec-engine
+  tag: latest
+  pullPolicy: IfNotPresent
+  pullSecrets:
+    - name: regcred
+
+service:
+  type: ClusterIP
+  port: 8000
+  targetPort: 8000
+  # HTTPS port for internal mTLS
+  httpsPort: 8443
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+    nginx.ingress.kubernetes.io/rate-limit: "1000"
+    nginx.ingress.kubernetes.io/rate-limit-window: "60"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+      add_header X-Frame-Options "DENY" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';" always;
+  hosts:
+    - host: api.rec-engine.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: rec-engine-tls
+      hosts:
+        - api.rec-engine.example.com
+
+resources:
+  requests:
+    cpu: 1000m
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 50
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 4
+          periodSeconds: 15
+      selectPolicy: Max
+
+env:
+  ENVIRONMENT: production
+  DEBUG: "false"
+  # Security configuration
+  SECURITY_SECRET_BACKEND: vault
+  VAULT_ADDR: https://vault.example.com:8200
+  VAULT_NAMESPACE: rec-engine
+  VAULT_MOUNT_POINT: secret
+  VAULT_KV_VERSION: "2"
+  VAULT_AUTH_METHOD: kubernetes
+  VAULT_ROLE: rec-engine
+  # OIDC/JWT
+  OIDC_JWKS_URL: https://auth.example.com/.well-known/jwks.json
+  OIDC_ISSUER: https://auth.example.com
+  OIDC_AUDIENCE: rec-engine-api
+  # CORS (explicit domains)
+  SECURITY_CORS_ORIGINS: https://app.example.com,https://dashboard.example.com,https://admin.example.com
+  # Kafka with SASL_SSL
+  KAFKA_BOOTSTRAP_SERVERS: kafka-0.kafka-headless:9093,kafka-1.kafka-headless:9093,kafka-2.kafka-headless:9093
+  KAFKA_SECURITY_PROTOCOL: SASL_SSL
+  KAFKA_SASL_MECHANISM: SCRAM-SHA-512
+  KAFKA_SASL_USERNAME: api-user
+  KAFKA_SSL_CAFILE: /certs/ca.crt
+  KAFKA_SSL_CERTFILE: /certs/kafka-client.crt
+  KAFKA_SSL_KEYFILE: /certs/kafka-client.key
+  KAFKA_SSL_CHECK_HOSTNAME: "true"
+  # Redis with TLS
+  REDIS_HOST: redis-master
+  REDIS_PORT: "6380"
+  REDIS_SSL_CERTFILE: /certs/redis-client.crt
+  REDIS_SSL_KEYFILE: /certs/redis-client.key
+  REDIS_SSL_CAFILE: /certs/ca.crt
+  REDIS_SSL_CHECK_HOSTNAME: "true"
+  # PostgreSQL with TLS
+  DATABASE_HOST: postgres-primary
+  DATABASE_PORT: "5432"
+  DATABASE_USER: rec_user
+  DATABASE_SSL_MODE: verify-full
+  DATABASE_SSL_CERT: /certs/postgres-client.crt
+  DATABASE_SSL_KEY: /certs/postgres-client.key
+  DATABASE_SSL_ROOT_CERT: /certs/ca.crt
+  # API TLS
+  API_SSL_CERTFILE: /certs/api-server.crt
+  API_SSL_KEYFILE: /certs/api-server.key
+  API_SSL_CAFILE: /certs/ca.crt
+  # Monitoring
+  MONITORING_LOG_LEVEL: INFO
+  MONITORING_LOG_FORMAT: json
+  MONITORING_TRACING_SAMPLE_RATE: "0.1"
+  MONITORING_JAEGER_ENDPOINT: http://jaeger-collector:14268/api/traces
+  # Model/Features
+  MODEL_INDEX_TYPE: scann
+  FEATURE_STORE_ONLINE_STORE: redis
+  FEATURE_STORE_OFFLINE_STORE: postgres
+
+# Vault Agent Injector for secret injection
+vaultAgent:
+  enabled: true
+  image: hashicorp/vault-agent:1.15
+  configMap:
+    name: rec-engine-vault-config
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/agent-inject-status: "update"
+    vault.hashicorp.com/role: rec-engine
+    vault.hashicorp.com/agent-inject-secret-kafka: rec-engine/kafka
+    vault.hashicorp.com/agent-inject-template-kafka: |
+      {{- with secret "rec-engine/kafka" -}}
+      export KAFKA_SASL_USERNAME="{{ .Data.data.username }}"
+      export KAFKA_SASL_PASSWORD="{{ .Data.data.password }}"
+      {{- end }}
+    vault.hashicorp.com/agent-inject-secret-redis: rec-engine/redis
+    vault.hashicorp.com/agent-inject-template-redis: |
+      {{- with secret "rec-engine/redis" -}}
+      export REDIS_PASSWORD="{{ .Data.data.password }}"
+      {{- end }}
+    vault.hashicorp.com/agent-inject-secret-database: rec-engine/database
+    vault.hashicorp.com/agent-inject-template-database: |
+      {{- with secret "rec-engine/database" -}}
+      export DATABASE_PASSWORD="{{ .Data.data.password }}"
+      {{- end }}
+    vault.hashicorp.com/agent-inject-secret-api: rec-engine/api
+    vault.hashicorp.com/agent-inject-template-api: |
+      {{- with secret "rec-engine/api" -}}
+      # API secrets if needed
+      {{- end }}
+
+nodeSelector:
+  kubernetes.io/os: linux
+
+tolerations:
+  - key: "dedicated"
+    operator: "Equal"
+    value: "rec-engine"
+    effect: "NoSchedule"
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - rec-engine-api
+          topologyKey: kubernetes.io/hostname
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: workload-type
+              operator: In
+              values:
+                - stateless
+
+serviceAccount:
+  create: true
+  name: rec-engine-api
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/rec-engine-api
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8000"
+  prometheus.io/path: /metrics
+  prometheus.io/scheme: https
+  vault.hashicorp.com/agent-inject: "true"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8443
+    scheme: HTTPS
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8443
+    scheme: HTTPS
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# Certificate volumes for mTLS
+volumes:
+  - name: certs
+    secret:
+      secretName: rec-engine-certs
+      defaultMode: 0400
+  - name: vault-config
+    configMap:
+      name: rec-engine-vault-config
+
+volumeMounts:
+  - name: certs
+    mountPath: /certs
+    readOnly: true
+  - name: vault-config
+    mountPath: /vault/config
+    readOnly: true
+
+# Network policies (applied separately via kustomize)
+networkPolicy:
+  enabled: true
+
+# PodDisruptionBudget for high availability
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 50%
+
+# ServiceMonitor for Prometheus Operator
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  scrapeTimeout: 10s
+  scheme: https
+  tlsConfig:
+    caFile: /etc/prometheus/certs/ca.crt
+    certFile: /etc/prometheus/certs/client.crt
+    keyFile: /etc/prometheus/certs/client.key
+    insecureSkipVerify: false
+
+# Additional containers for sidecars
+extraContainers:
+  - name: vault-agent
+    image: hashicorp/vault-agent:1.15
+    args:
+      - agent
+      - -config=/vault/config/agent.hcl
+    volumeMounts:
+      - name: certs
+        mountPath: /certs
+        readOnly: true
+      - name: vault-config
+        mountPath: /vault/config
+        readOnly: true
+    env:
+      - name: VAULT_ADDR
+        value: https://vault.example.com:8200
+      - name: VAULT_NAMESPACE
+        value: rec-engine
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi

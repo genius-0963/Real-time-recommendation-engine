@@ -1,0 +1,67 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: schema-registry
+  namespace: data-services
+  labels:
+    app: schema-registry
+    policy: network-segmentation
+spec:
+  podSelector:
+    matchLabels:
+      app: schema-registry
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow access from API pods
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: rec-engine
+        - podSelector:
+            matchLabels:
+              app: rec-engine-api
+      ports:
+        - protocol: TCP
+          port: 8081
+    # Allow access from stream processor
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: rec-engine
+        - podSelector:
+            matchLabels:
+              app: stream-processor
+      ports:
+        - protocol: TCP
+          port: 8081
+    # Allow access from monitoring
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8081
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow access to Kafka
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9093

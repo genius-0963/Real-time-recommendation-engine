@@ -1,0 +1,39 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: rec-engine
+
+resources:
+  - 00-namespace.yaml
+  - 01-api-network-policy.yaml
+  - 02-redis-network-policy.yaml
+  - 03-postgresql-network-policy.yaml
+  - 04-kafka-network-policy.yaml
+  - 05-schema-registry-network-policy.yaml
+  - 99-default-deny.yaml
+
+commonLabels:
+  managed-by: kustomize
+  component: network-policies
+  environment: production
+
+patches:
+  - patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: rec-engine-api
+        namespace: rec-engine
+      spec:
+        ingress:
+          - from:
+              - namespaceSelector:
+                  matchLabels:
+                    name: ingress-nginx
+            ports:
+              - protocol: TCP
+                port: 8000
+    target:
+      kind: NetworkPolicy
+      name: rec-engine-api
+      namespace: rec-engine

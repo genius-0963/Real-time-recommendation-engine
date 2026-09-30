@@ -1,0 +1,84 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka
+  namespace: data-services
+  labels:
+    app: kafka
+    policy: network-segmentation
+spec:
+  podSelector:
+    matchLabels:
+      app: kafka
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow access from API pods (producer)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: rec-engine
+        - podSelector:
+            matchLabels:
+              app: rec-engine-api
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9093
+    # Allow access from stream processor (consumer/producer)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: rec-engine
+        - podSelector:
+            matchLabels:
+              app: stream-processor
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9093
+    # Allow access from Schema Registry
+    - from:
+        - podSelector:
+            matchLabels:
+              app: schema-registry
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9093
+    # Allow access from monitoring
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9093
+        - protocol: TCP
+          port: 9091  # JMX exporter
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow access to ZooKeeper
+    - to:
+        - podSelector:
+            matchLabels:
+              app: zookeeper
+      ports:
+        - protocol: TCP
+          port: 2181
+    # No external egress for Kafka

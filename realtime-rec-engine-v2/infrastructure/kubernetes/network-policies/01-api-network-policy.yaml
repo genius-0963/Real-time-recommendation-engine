@@ -1,0 +1,125 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rec-engine-api
+  namespace: rec-engine
+  labels:
+    app: rec-engine-api
+    policy: network-segmentation
+spec:
+  podSelector:
+    matchLabels:
+      app: rec-engine-api
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow ingress from ingress-nginx namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8000
+    # Allow health checks from monitoring namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000
+    # Allow internal communication between API pods (for graceful shutdown coordination)
+    - from:
+        - podSelector:
+            matchLabels:
+              app: rec-engine-api
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow access to Redis (data-services namespace)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: data-services
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # Allow access to PostgreSQL (data-services namespace)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: data-services
+        - podSelector:
+            matchLabels:
+              app: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Allow access to Kafka (data-services namespace)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: data-services
+        - podSelector:
+            matchLabels:
+              app: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9093
+    # Allow access to Schema Registry (data-services namespace)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: data-services
+        - podSelector:
+            matchLabels:
+              app: schema-registry
+      ports:
+        - protocol: TCP
+          port: 8081
+    # Allow access to Vault (if in separate namespace)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: vault
+      ports:
+        - protocol: TCP
+          port: 8200
+    # Allow access to monitoring (for metrics scraping)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090
+        - protocol: TCP
+          port: 9093
+    # Allow HTTPS egress for external APIs (OIDC, etc.)
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 443
+    # Allow HTTP egress for health checks (if needed)
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 80

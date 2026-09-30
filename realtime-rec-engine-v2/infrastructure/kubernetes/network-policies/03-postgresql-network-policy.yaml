@@ -1,0 +1,74 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgresql
+  namespace: data-services
+  labels:
+    app: postgresql
+    policy: network-segmentation
+spec:
+  podSelector:
+    matchLabels:
+      app: postgresql
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow access from API pods (offline feature store)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: rec-engine
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Allow access from feature sync pipeline
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: rec-engine
+        - podSelector:
+            matchLabels:
+              app: feature-sync
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Allow access from training jobs
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: rec-engine
+        - podSelector:
+            matchLabels:
+              app: training
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Allow access from monitoring for health checks
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Allow access from backup jobs
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: backup
+      ports:
+        - protocol: TCP
+          port: 5432
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # No external egress for PostgreSQL

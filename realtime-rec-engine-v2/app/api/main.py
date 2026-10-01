@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, Response
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, Response, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -50,9 +50,16 @@ from app.api.validators import (
 from app.services.recommendation_service import RecommendationService
 from app.services.feature_service import FeatureService
 from app.cache.redis_cache import RedisCache
-from app.monitoring.metrics_collector import MetricsCollector
+from app.monitoring.metrics_collector import MetricsCollector, MetricsConfig
 from app.monitoring.rate_limiter import create_rate_limiter, check_rate_limit, MultiTierRateLimiter
 from app.monitoring.middleware import setup_middleware
+from app.monitoring.audit import (
+    get_audit_logger, AuditLogger, AuditEventType, AuditDecision,
+    set_correlation_id, set_request_id, clear_context
+)
+from app.monitoring.pii_scrubber import (
+    get_pii_scrubber, PIIScrubbingFilter, setup_pii_scrubbing
+)
 from app.experiments.ab_testing import ABTestManager
 
 logging.basicConfig(level=logging.INFO)
@@ -66,6 +73,8 @@ cache = None
 metrics = None
 rate_limiter: MultiTierRateLimiter = None
 ab_test_manager = None
+audit_logger = None
+pii_scrubber = None
 
 
 @asynccontextmanager
@@ -74,16 +83,48 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting recommendation engine API")
     
-    global recommendation_service, feature_service, cache, metrics, rate_limiter, ab_test_manager
+    global recommendation_service, feature_service, cache, metrics, rate_limiter, ab_test_manager, audit_logger, pii_scrubber
     
     try:
+        # Initialize audit logger and PII scrubber first
+        audit_logger = get_audit_logger()
+        pii_scrubber = get_pii_scrubber()
+        
+        # Setup PII scrubbing for all loggers
+        setup_pii_scrubbing(logger_name="", enabled=not config.debug)
+        setup_pii_scrubbing(logger_name="uvicorn.access", enabled=True)
+        setup_pii_scrubbing(logger_name="uvicorn.error", enabled=True)
+        
+        # Log service start
+        audit_logger.log(
+            event_type=AuditEventType.SERVICE_START,
+            decision=AuditDecision.ALLOW,
+            actor_id="system",
+            actor_type="system",
+            resource_type="service",
+            resource_id="rec-engine-api",
+            action="startup",
+            endpoint="/",
+            method="INTERNAL",
+            status_code=200,
+            data_classification="internal"
+        )
+        
         # Initialize services
         cache = RedisCache(config.redis)
         feature_service = FeatureService(config.feature_store, cache)
         recommendation_service = RecommendationService(
             config.model, feature_service, cache
         )
-        metrics = MetricsCollector(config.monitoring)
+        
+        # Initialize metrics with SLA-aligned config
+        metrics_config = MetricsConfig(
+            sla_buckets=config.monitoring.sla_buckets if hasattr(config.monitoring, 'sla_buckets') else None,
+            require_auth=True,
+            allowed_scopes=["metrics:read"]
+        )
+        metrics = MetricsCollector(metrics_config)
+        
         ab_test_manager = ABTestManager(config.experiments)
         
         # Initialize distributed rate limiter
@@ -104,6 +145,20 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Shutting down recommendation engine API")
+    
+    audit_logger.log(
+        event_type=AuditEventType.SERVICE_STOP,
+        decision=AuditDecision.ALLOW,
+        actor_id="system",
+        actor_type="system",
+        resource_type="service",
+        resource_id="rec-engine-api",
+        action="shutdown",
+        endpoint="/",
+        method="INTERNAL",
+        status_code=200,
+        data_classification="internal"
+    )
     
     if recommendation_service:
         await recommendation_service.cleanup()
@@ -172,8 +227,12 @@ async def rate_limit_dependency(request: Request, user: TokenClaims = Depends(re
 
 # API endpoints
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
-async def health_check():
+async def health_check(request: Request):
     """Health check endpoint."""
+    # Set correlation ID for this request
+    set_correlation_id(getattr(request.state, "request_id", None))
+    set_request_id(getattr(request.state, "request_id", None))
+    
     try:
         # Check all services
         services_healthy = True
@@ -198,6 +257,21 @@ async def health_check():
             services_healthy = services_healthy and feature_healthy
         
         status_code = 200 if services_healthy else 503
+        
+        # Audit log
+        audit_logger.log(
+            event_type=AuditEventType.HEALTH_CHECK,
+            decision=AuditDecision.ALLOW if services_healthy else AuditDecision.ERROR,
+            actor_id="system",
+            actor_type="system",
+            resource_type="health",
+            resource_id="health_check",
+            action="health_check",
+            endpoint="/health",
+            method="GET",
+            status_code=status_code,
+            data_classification="public"
+        )
         
         return HealthResponse(
             status="healthy" if services_healthy else "unhealthy",
@@ -228,13 +302,42 @@ async def get_recommendations(
     background_tasks: BackgroundTasks,
     user: TokenClaims = Depends(require_rec_read),
     _: None = Depends(rate_limit_dependency),
+    req: Request = None
 ):
     """Get personalized recommendations for a user."""
     request_id = str(uuid.uuid4())
+    set_correlation_id(request_id)
+    set_request_id(getattr(req.state, "request_id", None) if req else request_id)
     start_time = time.time()
     
     try:
         logger.info(f"Processing recommendation request {request_id} for user {request.user_id}")
+        
+        # Audit log - authorization
+        audit_logger.log_authz_allow(
+            user_id=user.sub,
+            roles=user.roles,
+            resource_type="recommendation",
+            resource_id=f"rec_{request.num_recommendations}",
+            action="recommend",
+            endpoint="/recommend",
+            method="POST",
+            correlation_id=request_id
+        )
+        
+        # Audit log - data access
+        audit_logger.log_data_access(
+            user_id=user.sub,
+            roles=user.roles,
+            resource_type="recommendation",
+            resource_id=f"rec_{request.num_recommendations}",
+            resource_owner=request.user_id,
+            action="read",
+            endpoint="/recommend",
+            method="POST",
+            pii_accessed=True,
+            correlation_id=request_id
+        )
         
         # A/B test routing
         experiment_config = None
@@ -302,6 +405,17 @@ async def get_recommendations(
             experiment_id=experiment_config.get("experiment_id") if experiment_config else None
         )
         
+        # Audit log - recommendation generated
+        audit_logger.log_recommendation_request(
+            user_id=request.user_id,
+            roles=user.roles,
+            num_recommendations=len(response_items),
+            endpoint="/recommend",
+            method="POST",
+            latency_ms=metadata["latency_ms"],
+            correlation_id=request_id
+        )
+        
         logger.info(f"Generated {len(response_items)} recommendations for user {request.user_id} "
                    f"in {metadata['latency_ms']:.2f}ms")
         
@@ -315,6 +429,25 @@ async def get_recommendations(
             endpoint="/recommend",
             error_type=str(type(e).__name__),
             user_id=request.user_id
+        )
+        
+        # Audit log - error
+        audit_logger.log(
+            event_type=AuditEventType.RECOMMENDATION_REQUEST,
+            decision=AuditDecision.ERROR,
+            actor_id=request.user_id,
+            actor_type="user",
+            actor_roles=user.roles,
+            resource_type="recommendation",
+            resource_id=f"rec_{request.num_recommendations}",
+            action="recommend",
+            endpoint="/recommend",
+            method="POST",
+            status_code=500,
+            error_message=str(e),
+            latency_ms=(time.time() - start_time) * 1000,
+            correlation_id=request_id,
+            data_classification="confidential"
         )
         
         raise HTTPException(
@@ -586,22 +719,65 @@ async def get_item_features(
         )
 
 
-@app.get("/metrics", response_model=MetricsResponse, tags=["Monitoring"])
+@app.get("/metrics", tags=["Monitoring"])
 async def get_metrics(
+    request: Request,
     user: TokenClaims = Depends(require_metrics_read),
     _: None = Depends(rate_limit_dependency),
 ):
-    """Get system metrics."""
+    """Get Prometheus metrics (secured behind auth)."""
+    set_correlation_id(getattr(request.state, "request_id", None))
+    set_request_id(getattr(request.state, "request_id", None))
+    
     try:
-        metrics_data = await metrics.get_current_metrics()
+        # Audit log - metrics access
+        audit_logger.log(
+            event_type=AuditEventType.DATA_READ,
+            decision=AuditDecision.ALLOW,
+            actor_id=user.sub,
+            actor_type="user",
+            actor_roles=user.roles,
+            resource_type="metrics",
+            resource_id="prometheus_metrics",
+            action="read",
+            endpoint="/metrics",
+            method="GET",
+            status_code=200,
+            correlation_id=getattr(request.state, "request_id", None),
+            data_classification="internal"
+        )
         
-        return MetricsResponse(
-            timestamp=datetime.now(timezone.utc),
-            metrics=metrics_data
+        # Return Prometheus format
+        prometheus_metrics = metrics.get_metrics()
+        
+        # Record metrics access
+        metrics.record_request("GET", "/metrics", 200, 0.001)
+        
+        return Response(
+            content=prometheus_metrics,
+            media_type=metrics.get_content_type()
         )
         
     except Exception as e:
         logger.error(f"Failed to get metrics: {e}")
+        
+        audit_logger.log(
+            event_type=AuditEventType.DATA_READ,
+            decision=AuditDecision.ERROR,
+            actor_id=user.sub,
+            actor_type="user",
+            actor_roles=user.roles,
+            resource_type="metrics",
+            resource_id="prometheus_metrics",
+            action="read",
+            endpoint="/metrics",
+            method="GET",
+            status_code=500,
+            error_message=str(e),
+            correlation_id=getattr(request.state, "request_id", None),
+            data_classification="internal"
+        )
+        
         raise HTTPException(
             status_code=500,
             detail=f"Failed to get metrics: {str(e)}"
